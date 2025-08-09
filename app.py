@@ -1,12 +1,3 @@
-# app.py
-# ------------------------------------------------------------
-# One-page flow:
-# Upload notes image + HTML templates → GPT JSON (multilingual)
-# → Safe DALL·E Images → S3 → JSON (CDN resized URLs)
-# → (optional) SEO metadata
-# → (optional) Azure Speech TTS MP3 → S3 → add audio fields
-# → Fill all HTML templates → ZIP download + JSON download
-# ------------------------------------------------------------
 import os
 import io
 import re
@@ -21,6 +12,14 @@ from datetime import datetime
 from PIL import Image
 import streamlit as st
 
+# --- Azure Doc Intelligence SDK ---
+try:
+    from azure.ai.documentintelligence import DocumentIntelligenceClient
+    from azure.core.credentials import AzureKeyCredential
+except Exception:
+    DocumentIntelligenceClient = None  # we'll error nicely later
+    AzureKeyCredential = None
+
 # ---------------------------
 # Page config
 # ---------------------------
@@ -30,7 +29,7 @@ st.set_page_config(
     layout="centered"
 )
 st.title("🧠 Suvichaar Builder")
-st.caption("Upload one notes image + multiple HTML templates → JSON + Images + (optional) TTS → Filled HTML + downloads")
+st.caption("OCR (Doc Intelligence) → GPT JSON → DALL·E → S3/CDN → (optional) SEO/TTS → Fill HTML templates → Download")
 
 # ---------------------------
 # Secrets / Config
@@ -41,14 +40,18 @@ def get_secret(key, default=None):
     except Exception:
         return default
 
-# Azure OpenAI (vision)
+# Azure OpenAI (GPT)
 AZURE_API_KEY     = get_secret("AZURE_API_KEY")
-AZURE_ENDPOINT    = get_secret("AZURE_ENDPOINT")
-AZURE_DEPLOYMENT  = get_secret("AZURE_DEPLOYMENT", "gpt-4o")  # vision-capable model
+AZURE_ENDPOINT    = get_secret("AZURE_ENDPOINT")  # https://<resource>.openai.azure.com
+AZURE_DEPLOYMENT  = get_secret("AZURE_DEPLOYMENT", "gpt-4o")  # your *deployment* name
 AZURE_API_VERSION = get_secret("AZURE_API_VERSION", "2024-08-01-preview")
 
-# Azure DALL·E
-DALE_ENDPOINT     = get_secret("DALE_ENDPOINT")  # full Azure DALL·E images/generations endpoint
+# Azure Document Intelligence (OCR) — using your variable names
+AZURE_DI_ENDPOINT = get_secret("AZURE_DI_ENDPOINT")  # https://<your-di>.cognitiveservices.azure.com/
+AZURE_DI_KEY      = get_secret("AZURE_DI_KEY")
+
+# Azure DALL·E (Images)
+DALE_ENDPOINT     = get_secret("DALE_ENDPOINT")  # full images/generations URL or host; we POST to it as-is
 DAALE_KEY         = get_secret("DAALE_KEY")
 
 # AWS S3
@@ -69,13 +72,17 @@ AZURE_SPEECH_KEY     = get_secret("AZURE_SPEECH_KEY")
 AZURE_SPEECH_REGION  = get_secret("AZURE_SPEECH_REGION", "eastus")
 VOICE_NAME_DEFAULT   = get_secret("VOICE_NAME", "hi-IN-AaravNeural")
 
-# CDN for audio files (served via CloudFront)
+# CDN base for audio (CloudFront etc.)
 CDN_BASE             = get_secret("CDN_BASE", "https://cdn.suvichaar.org/")
 
 # Sanity checks (warn if missing)
 missing_core = []
-for k in ["AZURE_API_KEY", "AZURE_ENDPOINT", "AZURE_DEPLOYMENT", "DALE_ENDPOINT", "DAALE_KEY",
-          "AWS_ACCESS_KEY", "AWS_SECRET_KEY", "AWS_BUCKET"]:
+for k in [
+    "AZURE_API_KEY", "AZURE_ENDPOINT", "AZURE_DEPLOYMENT",
+    "AZURE_DI_ENDPOINT", "AZURE_DI_KEY",
+    "DALE_ENDPOINT", "DAALE_KEY",
+    "AWS_ACCESS_KEY", "AWS_SECRET_KEY", "AWS_BUCKET"
+]:
     if not get_secret(k):
         missing_core.append(k)
 if missing_core:
@@ -101,32 +108,6 @@ SAFE_FALLBACK = (
     "flat vector style, bright colors."
 )
 
-def sanitize_prompt(chat_url: str, headers: dict, original_prompt: str) -> str:
-    """Rewrite any risky prompt into a safe, positive, family-friendly version using Azure Chat."""
-    sanitize_payload = {
-        "messages": [
-            {"role": "system", "content": (
-                "Rewrite image prompts to be safe, positive, inclusive, and family-friendly. "
-                "Remove any hate/harassment/violence/adult/illegal/extremist content, slogans, logos, "
-                "or real-person likenesses. Keep the core educational idea and flat vector art style. "
-                "Return ONLY the rewritten prompt text."
-            )},
-            {"role": "user", "content": f"Original prompt:\n{original_prompt}\n\nRewritten safe prompt:"}
-        ],
-        "temperature": 0.2,
-        "max_tokens": 300
-    }
-    try:
-        sr = requests.post(chat_url, headers=headers, json=sanitize_payload, timeout=60)
-        if sr.status_code == 200:
-            return sr.json()["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        st.info(f"Sanitizer call failed; using local guards: {e}")
-
-    return (original_prompt +
-            "\nFlat vector illustration, bright colors, no text, no logos, no brands, "
-            "no real persons, family-friendly, inclusive, peaceful.")
-
 def robust_parse_model_json(raw_reply: str):
     """Parse model reply into a dict or return None."""
     parsed = None
@@ -148,6 +129,7 @@ Keys (English), values in detected language. If any field is missing, use an emp
 {
   "language": "hi|en|bn|ta|te|mr|gu|kn|pa|en-IN|...",
   "storytitle": "...",
+  "s1paragraph1": "...",
   "s2paragraph1": "...",
   "s3paragraph1": "...",
   "s4paragraph1": "...",
@@ -184,16 +166,17 @@ Return ONLY valid JSON, no code fences, no commentary.
         return None
 
 def call_azure_chat(messages, *, temperature=0.2, max_tokens=1800, force_json=True):
-    """Call Azure Chat with JSON mode, fallback to non-JSON if needed. Returns (ok, content_or_err)."""
+    """Call Azure Chat (JSON mode default). Returns (ok, content_or_err)."""
     chat_headers = {"Content-Type": "application/json", "api-key": AZURE_API_KEY}
-    chat_url = f"{AZURE_ENDPOINT}/openai/deployments/{AZURE_DEPLOYMENT}/chat/completions?api-version={AZURE_API_VERSION}"
+    chat_url = f"{AZURE_ENDPOINT.rstrip('/')}/openai/deployments/{AZURE_DEPLOYMENT}/chat/completions"
+    params = {"api-version": AZURE_API_VERSION}
 
     body = {"messages": messages, "temperature": temperature, "max_tokens": max_tokens}
     if force_json:
         body["response_format"] = {"type": "json_object"}
 
     try:
-        res = requests.post(chat_url, headers=chat_headers, json=body, timeout=150)
+        res = requests.post(chat_url, headers=chat_headers, params=params, json=body, timeout=150)
     except Exception as e:
         return False, f"Azure request failed: {e}"
 
@@ -204,7 +187,7 @@ def call_azure_chat(messages, *, temperature=0.2, max_tokens=1800, force_json=Tr
     if force_json:
         body.pop("response_format", None)
         try:
-            res2 = requests.post(chat_url, headers=chat_headers, json=body, timeout=150)
+            res2 = requests.post(chat_url, headers=chat_headers, params=params, json=body, timeout=150)
             if res2.status_code == 200:
                 return True, res2.json()["choices"][0]["message"]["content"]
             return False, f"Azure Chat error: {res2.status_code} — {res2.text[:300]}"
@@ -212,6 +195,67 @@ def call_azure_chat(messages, *, temperature=0.2, max_tokens=1800, force_json=Tr
             return False, f"Azure retry failed: {e}"
 
     return False, f"Azure Chat error: {res.status_code} — {res.text[:300]}"
+
+# ---------- Azure Document Intelligence (OCR) ----------
+def ocr_extract_bytes(image_bytes: bytes) -> tuple[bool, str]:
+    """
+    Uses Azure Document Intelligence 'prebuilt-read' to extract text.
+    Returns (ok, text_or_error).
+    """
+    if DocumentIntelligenceClient is None or AzureKeyCredential is None:
+        return False, ("azure-ai-documentintelligence is not installed. "
+                       "Add it to requirements.txt and set AZURE_DI_ENDPOINT / AZURE_DI_KEY.")
+
+    if not (AZURE_DI_ENDPOINT and AZURE_DI_KEY):
+        return False, "Missing AZURE_DI_ENDPOINT / AZURE_DI_KEY."
+
+    try:
+        client = DocumentIntelligenceClient(
+            endpoint=AZURE_DI_ENDPOINT.rstrip("/"),
+            credential=AzureKeyCredential(AZURE_DI_KEY),
+        )
+        poller = client.begin_analyze_document("prebuilt-read", body=image_bytes)
+        doc = poller.result()
+        paragraphs = getattr(doc, "paragraphs", None) or []
+        if paragraphs:
+            text = "\n".join(p.content for p in paragraphs if getattr(p, "content", None))
+            text = (text or "").strip()
+            if text:
+                return True, text
+        # fallback to raw content if available
+        content = getattr(doc, "content", "") or ""
+        if content.strip():
+            return True, content.strip()
+        return False, "Document Intelligence returned no text."
+    except Exception as e:
+        return False, f"Doc Intelligence error: {e}"
+
+# -------- Image generation + S3 upload --------
+def sanitize_prompt(chat_url: str, headers: dict, original_prompt: str) -> str:
+    """Rewrite any risky prompt into a safe, positive, family-friendly version using Azure Chat."""
+    sanitize_payload = {
+        "messages": [
+            {"role": "system", "content": (
+                "Rewrite image prompts to be safe, positive, inclusive, and family-friendly. "
+                "Remove any hate/harassment/violence/adult/illegal/extremist content, slogans, logos, "
+                "or real-person likenesses. Keep the core educational idea and flat vector art style. "
+                "Return ONLY the rewritten prompt text."
+            )},
+            {"role": "user", "content": f"Original prompt:\n{original_prompt}\n\nRewritten safe prompt:"}
+        ],
+        "temperature": 0.2,
+        "max_tokens": 300
+    }
+    try:
+        sr = requests.post(chat_url, headers=headers, json=sanitize_payload, timeout=60)
+        if sr.status_code == 200:
+            return sr.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        st.info(f"Sanitizer call failed; using local guards: {e}")
+
+    return (original_prompt +
+            "\nFlat vector illustration, bright colors, no text, no logos, no brands, "
+            "no real persons, family-friendly, inclusive, peaceful.")
 
 def generate_and_upload_images(result_json: dict) -> dict:
     """Generate DALL·E images, upload originals to S3, return CDN resized URLs in JSON."""
@@ -242,7 +286,7 @@ def generate_and_upload_images(result_json: dict) -> dict:
     for i in range(1, 7):
         raw_prompt = result_json.get(f"s{i}alt1", "") or ""
         chat_headers = {"Content-Type": "application/json", "api-key": AZURE_API_KEY}
-        chat_url = f"{AZURE_ENDPOINT}/openai/deployments/{AZURE_DEPLOYMENT}/chat/completions?api-version={AZURE_API_VERSION}"
+        chat_url = f"{AZURE_ENDPOINT.rstrip('/')}/openai/deployments/{AZURE_DEPLOYMENT}/chat/completions?api-version={AZURE_API_VERSION}"
         safe_prompt = sanitize_prompt(chat_url, chat_headers, raw_prompt)
 
         payload = {"prompt": safe_prompt, "n": 1, "size": "1024x1024"}
@@ -310,6 +354,7 @@ Generate SEO metadata for a web story. Write ALL outputs in this language: {lang
 
 Title: {result_json.get("storytitle","")}
 Slides:
+- {result_json.get("s1paragraph1","")}
 - {result_json.get("s2paragraph1","")}
 - {result_json.get("s3paragraph1","")}
 - {result_json.get("s4paragraph1","")}
@@ -347,7 +392,6 @@ def pick_voice_for_language(lang_code: str, default_voice: str) -> str:
     if not lang_code:
         return default_voice
     l = lang_code.lower()
-    # Basic examples; customize for your needs
     if l.startswith("hi"):
         return "hi-IN-AaravNeural"
     if l.startswith("en-in"):
@@ -414,28 +458,31 @@ if run:
         st.error(f"Could not open image: {e}")
         st.stop()
 
-    # Prepare image for vision call
-    mime = img.type or "image/jpeg"
-    if not (isinstance(mime, str) and mime.startswith("image/")):
-        mime = "image/jpeg"
-    base64_img = base64.b64encode(raw_bytes).decode("utf-8")
-    user_content = [
-        {"type": "text", "text": "Analyze this notes image and return the JSON."},
-        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{base64_img}"}}
-    ]
+    # -------- OCR with Azure Document Intelligence --------
+    with st.spinner("Reading text with Azure Document Intelligence (prebuilt-read)…"):
+        ok_ocr, raw_text = ocr_extract_bytes(raw_bytes)
+        if not ok_ocr:
+            st.error(raw_text)
+            st.stop()
 
-    # Build vision prompt
+    with st.expander("🔎 OCR extracted text"):
+        st.write(raw_text[:20000] if raw_text else "(empty)")
+
+    # -------- Summarize with GPT into JSON (s1..s6) --------
     system_prompt = """
-You are a multilingual teaching assistant. The student has uploaded a notes image.
+You are a multilingual teaching assistant.
+
+INPUT:
+- You will receive raw OCR text from a notes image.
 
 MANDATORY:
-- Detect the PRIMARY language in the notes image (e.g., hi, en, bn, ta, te, mr, gu, kn, pa). Use a short BCP-47/ISO code when possible (e.g., "hi", "en", "en-IN").
+- Detect the PRIMARY language in the OCR text (e.g., hi, en, bn, ta, te, mr, gu, kn, pa). Use a short BCP-47/ISO code when possible (e.g., "hi", "en", "en-IN").
 - Produce ALL text fields strictly in that same language.
 
 Your job:
 1) Extract a short and catchy title → storytitle (in detected language)
-2) Summarise the content into 5 slides (s2paragraph1..s6paragraph1), each ≤ 400 characters (in detected language).
-3) For each paragraph (including the title), write a DALL·E prompt (s1alt1..s6alt1) for a 1024x1024 flat vector illustration: bright colors, clean lines, no text/captions/logos. (Prompts must not request text in the image.)
+2) Summarise the content into 6 slides (s1paragraph1..s6paragraph1), each ≤ 400 characters (in detected language).
+3) For each paragraph (including slide 1), write a DALL·E prompt (s1alt1..s6alt1) for a 1024x1024 flat vector illustration: bright colors, clean lines, no text/captions/logos. (Prompts must not request text in the image.)
 
 SAFETY & POSITIVITY RULES (MANDATORY):
 - If the source includes hate, harassment, violence, adult content, self-harm, illegal acts, or extremist symbols, DO NOT reproduce them.
@@ -444,10 +491,11 @@ SAFETY & POSITIVITY RULES (MANDATORY):
 - Never include real people’s likeness or sensitive groups in a negative way.
 - Avoid slogans, gestures, flags, trademarks, or captions. Absolutely NO TEXT in the image.
 
-Respond strictly in this JSON format (keys in English; values in detected language). Add a language code too:
+Respond strictly in this JSON format (keys in English; values in detected language):
 {
   "language": "hi",
   "storytitle": "...",
+  "s1paragraph1": "...",
   "s2paragraph1": "...",
   "s3paragraph1": "...",
   "s4paragraph1": "...",
@@ -461,13 +509,12 @@ Respond strictly in this JSON format (keys in English; values in detected langua
   "s6alt1": "..."
 }
 """
-
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_content}
+        {"role": "user", "content": f"OCR TEXT:\n{raw_text}\n\nReturn only the JSON object described above."}
     ]
 
-    with st.spinner("Analyzing image and generating structured JSON…"):
+    with st.spinner("Summarizing OCR text with Azure OpenAI…"):
         ok, content = call_azure_chat(messages, temperature=0.2, max_tokens=1800, force_json=True)
         if not ok:
             st.error(content)
@@ -477,7 +524,7 @@ Respond strictly in this JSON format (keys in English; values in detected langua
         if not isinstance(result, dict):
             # One-shot repair
             chat_headers = {"Content-Type": "application/json", "api-key": AZURE_API_KEY}
-            chat_url = f"{AZURE_ENDPOINT}/openai/deployments/{AZURE_DEPLOYMENT}/chat/completions?api-version={AZURE_API_VERSION}"
+            chat_url = f"{AZURE_ENDPOINT.rstrip('/')}/openai/deployments/{AZURE_DEPLOYMENT}/chat/completions?api-version={AZURE_API_VERSION}"
             fixed = repair_json_with_model(content, chat_url, chat_headers)
             if isinstance(fixed, dict):
                 result = fixed
@@ -489,23 +536,23 @@ Respond strictly in this JSON format (keys in English; values in detected langua
     detected_lang = str(result.get("language") or "").strip()
     st.info(f"Detected language: **{detected_lang or '(not provided)'}**")
 
-    st.success("Structured JSON created.")
+    st.success("Structured JSON created from OCR.")
     st.json(result, expanded=False)
 
-    # Generate DALL·E images → S3 → CDN URLs
+    # -------- DALL·E images → S3 → CDN --------
     with st.spinner("Generating DALL·E images and uploading to S3…"):
         final_json = generate_and_upload_images(result)
 
-    # SEO metadata
+    # -------- SEO metadata --------
     chat_headers = {"Content-Type": "application/json", "api-key": AZURE_API_KEY}
-    chat_url = f"{AZURE_ENDPOINT}/openai/deployments/{AZURE_DEPLOYMENT}/chat/completions?api-version={AZURE_API_VERSION}"
+    chat_url = f"{AZURE_ENDPOINT.rstrip('/')}/openai/deployments/{AZURE_DEPLOYMENT}/chat/completions?api-version={AZURE_API_VERSION}"
     if include_seo:
         with st.spinner("Generating SEO metadata…"):
             meta_desc, meta_keywords = generate_seo_metadata(chat_url, chat_headers, final_json, detected_lang)
             final_json["metadescription"] = meta_desc
             final_json["metakeywords"] = meta_keywords
 
-    # Optional: TTS
+    # -------- Optional: TTS --------
     if include_tts:
         try:
             import azure.cognitiveservices.speech as speechsdk
@@ -526,8 +573,9 @@ Respond strictly in this JSON format (keys in English; values in detected langua
         speech_config.speech_synthesis_voice_name = chosen_voice
         st.info(f"TTS voice: **{chosen_voice}**")
 
+        # Map paragraphs to audio fields (now s1..s6 paragraphs)
         field_mapping = {
-            "storytitle":    "s1audio1",
+            "s1paragraph1":  "s1audio1",
             "s2paragraph1":  "s2audio1",
             "s3paragraph1":  "s3audio1",
             "s4paragraph1":  "s4audio1",
@@ -569,7 +617,7 @@ Respond strictly in this JSON format (keys in English; values in detected langua
             if created_audio:
                 st.json({"audio_created": created_audio}, expanded=False)
 
-    # Add time fields (optional) before filling templates
+    # -------- Add time fields (optional) --------
     extra_fields = {}
     if add_time_fields:
         iso_now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
@@ -579,11 +627,10 @@ Respond strictly in this JSON format (keys in English; values in detected langua
     merged = dict(final_json)
     merged.update(extra_fields)
 
-    # Try to infer base name + timestamp
+    # -------- Fill templates and offer downloads --------
     base_name = (merged.get("storytitle", "webstory").replace(" ", "_").replace(":", "").lower())
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Fill all templates → ZIP
     if html_files:
         with st.spinner("Filling HTML templates…"):
             zip_buf = BytesIO()
@@ -598,8 +645,6 @@ Respond strictly in this JSON format (keys in English; values in detected langua
                     continue
 
                 filled, placeholders = fill_template_strict(html_text, merged)
-
-                # Report missing placeholders (present in template but not in merged JSON)
                 missing = sorted([p for p in placeholders if f"{{{{{p}}}}}" in html_text and p not in merged])
                 if missing:
                     per_file_reports.append((f.name, missing))
