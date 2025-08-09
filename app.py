@@ -46,12 +46,12 @@ AZURE_ENDPOINT    = get_secret("AZURE_ENDPOINT")  # https://<resource>.openai.az
 AZURE_DEPLOYMENT  = get_secret("AZURE_DEPLOYMENT", "gpt-4o")  # your *deployment* name
 AZURE_API_VERSION = get_secret("AZURE_API_VERSION", "2024-08-01-preview")
 
-# Azure Document Intelligence (OCR) — using your variable names
+# Azure Document Intelligence (OCR)
 AZURE_DI_ENDPOINT = get_secret("AZURE_DI_ENDPOINT")  # https://<your-di>.cognitiveservices.azure.com/
 AZURE_DI_KEY      = get_secret("AZURE_DI_KEY")
 
-# Azure DALL·E (Images)
-DALE_ENDPOINT     = get_secret("DALE_ENDPOINT")  # full images/generations URL or host; we POST to it as-is
+# Azure DALL·E (Images)  — keep endpoint EXACT as provided by you
+DALE_ENDPOINT     = get_secret("DALE_ENDPOINT")  # e.g. https://<...>.cognitiveservices.azure.com/openai/deployments/dall-e-3/images/generations?api-version=2024-02-01
 DAALE_KEY         = get_secret("DAALE_KEY")
 
 # AWS S3
@@ -157,10 +157,10 @@ Return ONLY valid JSON, no code fences, no commentary.
         "response_format": {"type": "json_object"}
     }
     try:
-        r = requests.post(chat_url, headers=headers, json=payload_fix, timeout=150)
-        if r.status_code != 200:
+        res = requests.post(chat_url, headers=headers, json=payload_fix, timeout=150)
+        if res.status_code != 200:
             return None
-        fixed = r.json()["choices"][0]["message"]["content"]
+        fixed = res.json()["choices"][0]["message"]["content"]
         return robust_parse_model_json(fixed)
     except Exception:
         return None
@@ -197,10 +197,10 @@ def call_azure_chat(messages, *, temperature=0.2, max_tokens=1800, force_json=Tr
     return False, f"Azure Chat error: {res.status_code} — {res.text[:300]}"
 
 # ---------- Azure Document Intelligence (OCR) ----------
-def ocr_extract_bytes(image_bytes: bytes) -> tuple[bool, str]:
+def ocr_extract_bytes(image_bytes: bytes):
     """
     Uses Azure Document Intelligence 'prebuilt-read' to extract text.
-    Returns (ok, text_or_error).
+    Returns (ok: bool, text_or_error: str).
     """
     if DocumentIntelligenceClient is None or AzureKeyCredential is None:
         return False, ("azure-ai-documentintelligence is not installed. "
@@ -334,15 +334,22 @@ def generate_and_upload_images(result_json: dict) -> dict:
 
     progress.empty()
 
-    # portrait cover from slide 1 via CDN (640x853)
+    # portrait cover from slide 1 via CDN (640x853) — keep both spellings for template compatibility
     try:
         if first_slide_key:
-            out["potraitcoverurl"] = build_resized_cdn_url(AWS_BUCKET, first_slide_key, 640, 853)
+            cover = build_resized_cdn_url(AWS_BUCKET, first_slide_key, 640, 853)
+            out["portraitcoverurl"] = cover
+            out["potraitcoverurl"] = cover  # backward-compat (common misspelling)
+            out["potraightcoverurl"] = cover  # another legacy misspelling used earlier
         else:
+            out["portraitcoverurl"] = DEFAULT_ERROR_IMAGE
             out["potraitcoverurl"] = DEFAULT_ERROR_IMAGE
+            out["potraightcoverurl"] = DEFAULT_ERROR_IMAGE
     except Exception as e:
         st.info(f"Portrait cover URL build failed: {e}")
+        out["portraitcoverurl"] = DEFAULT_ERROR_IMAGE
         out["potraitcoverurl"] = DEFAULT_ERROR_IMAGE
+        out["potraightcoverurl"] = DEFAULT_ERROR_IMAGE
 
     return out
 
@@ -414,7 +421,7 @@ def pick_voice_for_language(lang_code: str, default_voice: str) -> str:
         return "pa-IN-GeetikaNeural"
     return default_voice
 
-def fill_template_strict(template: str, data: dict) -> tuple[str, set]:
+def fill_template_strict(template: str, data: dict):
     """Replace {{key}} with string(value). Also return placeholders detected (for missing-report)."""
     placeholders = set(re.findall(r"\{\{\s*([a-zA-Z0-9_\-]+)\s*\}\}", template))
     for k, v in data.items():
@@ -468,7 +475,7 @@ if run:
     with st.expander("🔎 OCR extracted text"):
         st.write(raw_text[:20000] if raw_text else "(empty)")
 
-    # -------- Summarize with GPT into JSON (s1..s6) --------
+    # -------- Summarize with GPT into JSON (s1..s6 + s1alt..s6alt) --------
     system_prompt = """
 You are a multilingual teaching assistant.
 
@@ -536,6 +543,9 @@ Respond strictly in this JSON format (keys in English; values in detected langua
     detected_lang = str(result.get("language") or "").strip()
     st.info(f"Detected language: **{detected_lang or '(not provided)'}**")
 
+    # Keep OCR text too (handy for debugging or templates)
+    result["ocr_text"] = raw_text
+
     st.success("Structured JSON created from OCR.")
     st.json(result, expanded=False)
 
@@ -543,7 +553,7 @@ Respond strictly in this JSON format (keys in English; values in detected langua
     with st.spinner("Generating DALL·E images and uploading to S3…"):
         final_json = generate_and_upload_images(result)
 
-    # -------- SEO metadata --------
+    # -------- SEO metadata (optional) --------
     chat_headers = {"Content-Type": "application/json", "api-key": AZURE_API_KEY}
     chat_url = f"{AZURE_ENDPOINT.rstrip('/')}/openai/deployments/{AZURE_DEPLOYMENT}/chat/completions?api-version={AZURE_API_VERSION}"
     if include_seo:
@@ -573,7 +583,7 @@ Respond strictly in this JSON format (keys in English; values in detected langua
         speech_config.speech_synthesis_voice_name = chosen_voice
         st.info(f"TTS voice: **{chosen_voice}**")
 
-        # Map paragraphs to audio fields (now s1..s6 paragraphs)
+        # Map paragraphs to audio fields (s1..s6 paragraphs)
         field_mapping = {
             "s1paragraph1":  "s1audio1",
             "s2paragraph1":  "s2audio1",
@@ -631,10 +641,10 @@ Respond strictly in this JSON format (keys in English; values in detected langua
     base_name = (merged.get("storytitle", "webstory").replace(" ", "_").replace(":", "").lower())
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+    filled_items = []  # (filename, filled_html)
+
     if html_files:
         with st.spinner("Filling HTML templates…"):
-            zip_buf = BytesIO()
-            z = zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED)
             per_file_reports = []
 
             for f in html_files:
@@ -650,10 +660,7 @@ Respond strictly in this JSON format (keys in English; values in detected langua
                     per_file_reports.append((f.name, missing))
 
                 out_filename = f"{base_name}__{os.path.splitext(f.name)[0]}__{ts}.html"
-                z.writestr(out_filename, filled)
-
-            z.close()
-            zip_buf.seek(0)
+                filled_items.append((out_filename, filled))
 
         if per_file_reports:
             st.warning("Some templates contain placeholders not found in JSON:")
@@ -674,21 +681,31 @@ Respond strictly in this JSON format (keys in English; values in detected langua
             mime="application/json"
         )
 
-        # Download ZIP
-        st.download_button(
-            "⬇️ Download All Filled HTML (ZIP)",
-            data=zip_buf.getvalue(),
-            file_name=f"{base_name}__filled_{ts}.zip",
-            mime="application/zip"
-        )
+        # If exactly one template, also provide direct HTML download
+        if len(filled_items) == 1:
+            single_name, single_html = filled_items[0]
+            st.download_button(
+                "⬇️ Download Filled HTML",
+                data=single_html.encode("utf-8"),
+                file_name=single_name,
+                mime="text/html"
+            )
+        else:
+            # ZIP all filled HTMLs
+            zip_buf = BytesIO()
+            with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
+                for name, html in filled_items:
+                    z.writestr(name, html)
+            zip_buf.seek(0)
+
+            st.download_button(
+                "⬇️ Download All Filled HTML (ZIP)",
+                data=zip_buf.getvalue(),
+                file_name=f"{base_name}__filled_{ts}.zip",
+                mime="application/zip"
+            )
 
         # Optional preview
         show_preview = st.checkbox("Show preview of first filled template", value=False)
-        if show_preview:
-            with zipfile.ZipFile(BytesIO(zip_buf.getvalue()), "r") as z2:
-                names = z2.namelist()
-                if names:
-                    sample_html = z2.read(names[0]).decode("utf-8", errors="ignore")
-                    st.code(sample_html[:5000], language="html")
-                else:
-                    st.info("ZIP is empty (unexpected).")
+        if show_preview and filled_items:
+            st.code(filled_items[0][1][:5000], language="html")
