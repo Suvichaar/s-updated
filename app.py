@@ -50,7 +50,7 @@ AZURE_API_VERSION = get_secret("AZURE_API_VERSION", "2024-08-01-preview")
 AZURE_DI_ENDPOINT = get_secret("AZURE_DI_ENDPOINT")  # https://<your-di>.cognitiveservices.azure.com/
 AZURE_DI_KEY      = get_secret("AZURE_DI_KEY")
 
-# Azure DALL·E (Images)  — keep endpoint EXACT as provided by you
+# Azure DALL·E (Images)
 DALE_ENDPOINT     = get_secret("DALE_ENDPOINT")  # e.g. https://<...>/openai/deployments/dall-e-3/images/generations?api-version=2024-02-01
 DAALE_KEY         = get_secret("DAALE_KEY")
 
@@ -58,14 +58,18 @@ DAALE_KEY         = get_secret("DAALE_KEY")
 AWS_ACCESS_KEY    = get_secret("AWS_ACCESS_KEY")
 AWS_SECRET_KEY    = get_secret("AWS_SECRET_KEY")
 AWS_REGION        = get_secret("AWS_REGION", "ap-south-1")
-AWS_BUCKET        = get_secret("AWS_BUCKET")
-S3_PREFIX         = get_secret("S3_PREFIX", "media")
+AWS_BUCKET        = get_secret("AWS_BUCKET", "suvichaarapp")  # default to suvichaarapp
+S3_PREFIX         = get_secret("S3_PREFIX", "media")          # used for images/audio
+
+# HTML upload prefix + CDN base (for HTML)
+HTML_S3_PREFIX    = get_secret("HTML_S3_PREFIX", "webstory-html")
+CDN_HTML_BASE     = get_secret("CDN_HTML_BASE", "https://stories.suvichaar.org/webstory-html/")
 
 # CDN image handler prefix (base64-encoded template)
-CDN_PREFIX_MEDIA  = get_secret("CDN_PREFIX_MEDIA", "https://media.suvichaar.org/")
+CDN_PREFIX_MEDIA  = get_secret("CDN_PREFIX_MEDIA", "https://stories.suvichaar.org/")
 
 # Fallback image
-DEFAULT_ERROR_IMAGE = get_secret("DEFAULT_ERROR_IMAGE", "https://media.suvichaar.org/default-error.jpg")
+DEFAULT_ERROR_IMAGE = get_secret("DEFAULT_ERROR_IMAGE", "https://stories.suvichaar.org/default-error.jpg")
 
 # Azure Speech (TTS)
 AZURE_SPEECH_KEY     = get_secret("AZURE_SPEECH_KEY")
@@ -83,7 +87,7 @@ for k in [
     "DALE_ENDPOINT", "DAALE_KEY",
     "AWS_ACCESS_KEY", "AWS_SECRET_KEY", "AWS_BUCKET"
 ]:
-    if not get_secret(k):
+    if not get_secret(k, None):
         missing_core.append(k)
 if missing_core:
     st.warning("Add these secrets in `.streamlit/secrets.toml`: " + ", ".join(missing_core))
@@ -351,8 +355,8 @@ def generate_and_upload_images(result_json: dict) -> dict:
         if first_slide_key:
             cover = build_resized_cdn_url(AWS_BUCKET, first_slide_key, 640, 853)
             out["portraitcoverurl"] = cover
-            out["potraitcoverurl"] = cover  # backward-compat (common misspelling)
-            out["potraightcoverurl"] = cover  # another legacy misspelling used earlier
+            out["potraitcoverurl"] = cover  # backward-compat
+            out["potraightcoverurl"] = cover
         else:
             out["portraitcoverurl"] = DEFAULT_ERROR_IMAGE
             out["potraitcoverurl"] = DEFAULT_ERROR_IMAGE
@@ -601,9 +605,9 @@ Respond strictly in this JSON format (keys in English; values in Target language
         speech_config.speech_synthesis_voice_name = chosen_voice
         st.info(f"TTS voice: **{chosen_voice}**")
 
-        # Map paragraphs to audio fields (s1..s6 paragraphs)
+        # Map paragraphs to audio fields (s1..s6 paragraphs + title as s1audio1)
         field_mapping = {
-            "storytitle":  "s1audio1",
+            "storytitle":    "s1audio1",
             "s2paragraph1":  "s2audio1",
             "s3paragraph1":  "s3audio1",
             "s4paragraph1":  "s4audio1",
@@ -655,8 +659,15 @@ Respond strictly in this JSON format (keys in English; values in Target language
     merged = dict(final_json)
     merged.update(extra_fields)
 
-    # -------- Fill templates and offer downloads --------
-    base_name = (merged.get("storytitle", "webstory").replace(" ", "_").replace(":", "").lower())
+    # -------- Fill templates and offer downloads + S3 upload --------
+    def slugify_filename(text: str) -> str:
+        s = (text or "webstory").strip().lower()
+        s = re.sub(r"[:/\\]+", "-", s)
+        s = re.sub(r"\s+", "_", s)
+        s = re.sub(r"[^a-z0-9_\-\.]", "", s)
+        return s or "webstory"
+
+    base_name = slugify_filename(merged.get("storytitle", "webstory"))
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     filled_items = []  # (filename, filled_html)
@@ -677,7 +688,7 @@ Respond strictly in this JSON format (keys in English; values in Target language
                 if missing:
                     per_file_reports.append((f.name, missing))
 
-                out_filename = f"{base_name}__{os.path.splitext(f.name)[0]}__{ts}.html"
+                out_filename = f"{base_name}_{ts}.html"
                 filled_items.append((out_filename, filled))
 
         if per_file_reports:
@@ -685,9 +696,10 @@ Respond strictly in this JSON format (keys in English; values in Target language
             for name, missing in per_file_reports:
                 st.write(f"• **{name}** → missing: {', '.join(missing)}")
 
-        st.success("✅ Done! Download your files below.")
+        st.success("✅ Templates filled.")
 
-        # Download JSON
+        # Local download buttons (optional)
+        # Download JSON (local)
         json_name = f"{base_name}_{ts}.json"
         buf = io.StringIO()
         json.dump(merged, buf, ensure_ascii=False, indent=2)
@@ -699,7 +711,6 @@ Respond strictly in this JSON format (keys in English; values in Target language
             mime="application/json"
         )
 
-        # If exactly one template, also provide direct HTML download
         if len(filled_items) == 1:
             single_name, single_html = filled_items[0]
             st.download_button(
@@ -709,19 +720,66 @@ Respond strictly in this JSON format (keys in English; values in Target language
                 mime="text/html"
             )
         else:
-            # ZIP all filled HTMLs
             zip_buf = BytesIO()
             with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
                 for name, html in filled_items:
                     z.writestr(name, html)
             zip_buf.seek(0)
-
             st.download_button(
                 "⬇️ Download All Filled HTML (ZIP)",
                 data=zip_buf.getvalue(),
                 file_name=f"{base_name}__filled_{ts}.zip",
                 mime="application/zip"
             )
+
+        # ---------- NEW: Upload JSON + HTML to S3 and show CDN URLs ----------
+        st.subheader("🌐 Uploaded to CDN")
+        s3 = boto3.client(
+            "s3",
+            aws_access_key_id=AWS_ACCESS_KEY,
+            aws_secret_access_key=AWS_SECRET_KEY,
+            region_name=AWS_REGION
+        )
+
+        uploaded_urls = []
+
+        # 1) Upload JSON (optional but useful)
+        try:
+            json_key = f"{HTML_S3_PREFIX.rstrip('/')}/{base_name}_{ts}.json"
+            s3.put_object(
+                Bucket=AWS_BUCKET,
+                Key=json_key,
+                Body=json_str.encode("utf-8"),
+                ContentType="application/json",
+                CacheControl="public, max-age=300"
+            )
+            json_cdn_url = f"{CDN_HTML_BASE.rstrip('/')}/{base_name}_{ts}.json"
+            uploaded_urls.append(("JSON", json_cdn_url))
+        except Exception as e:
+            st.error(f"Failed to upload JSON to S3: {e}")
+
+        # 2) Upload each HTML file
+        for name, html in filled_items:
+            try:
+                html_key = f"{HTML_S3_PREFIX.rstrip('/')}/{name}"
+                s3.put_object(
+                    Bucket=AWS_BUCKET,
+                    Key=html_key,
+                    Body=html.encode("utf-8"),
+                    ContentType="text/html; charset=utf-8",
+                    CacheControl="public, max-age=300"
+                )
+                html_cdn_url = f"{CDN_HTML_BASE.rstrip('/')}/{name}"
+                uploaded_urls.append(("HTML", html_cdn_url))
+            except Exception as e:
+                st.error(f"Failed to upload HTML to S3 ({name}): {e}")
+
+        if uploaded_urls:
+            for kind, url in uploaded_urls:
+                st.markdown(f"- **{kind}**: {url}")
+            st.success("✅ Files uploaded to S3 and accessible via CDN.")
+        else:
+            st.error("No files were uploaded to the CDN. Check AWS credentials and bucket permissions.")
 
         # Optional preview
         show_preview = st.checkbox("Show preview of first filled template", value=False)
