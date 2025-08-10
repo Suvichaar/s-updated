@@ -51,7 +51,7 @@ AZURE_DI_ENDPOINT = get_secret("AZURE_DI_ENDPOINT")  # https://<your-di>.cogniti
 AZURE_DI_KEY      = get_secret("AZURE_DI_KEY")
 
 # Azure DALL·E (Images)  — keep endpoint EXACT as provided by you
-DALE_ENDPOINT     = get_secret("DALE_ENDPOINT")  # e.g. https://<...>.cognitiveservices.azure.com/openai/deployments/dall-e-3/images/generations?api-version=2024-02-01
+DALE_ENDPOINT     = get_secret("DALE_ENDPOINT")  # e.g. https://<...>/openai/deployments/dall-e-3/images/generations?api-version=2024-02-01
 DAALE_KEY         = get_secret("DAALE_KEY")
 
 # AWS S3
@@ -195,6 +195,18 @@ def call_azure_chat(messages, *, temperature=0.2, max_tokens=1800, force_json=Tr
             return False, f"Azure retry failed: {e}"
 
     return False, f"Azure Chat error: {res.status_code} — {res.text[:300]}"
+
+# ---------- Language auto-detect (Hindi vs English) ----------
+def detect_hi_or_en(text: str) -> str:
+    """Return 'hi' if text is mostly Devanagari, else 'en'."""
+    if not text:
+        return "en"
+    devanagari = sum(0x0900 <= ord(c) <= 0x097F for c in text)
+    latin = sum(('A' <= c <= 'Z') or ('a' <= c <= 'z') for c in text)
+    total_letters = devanagari + latin
+    if total_letters == 0:
+        return "hi" if devanagari > 0 else "en"
+    return "hi" if (devanagari / total_letters) >= 0.25 else "en"
 
 # ---------- Azure Document Intelligence (OCR) ----------
 def ocr_extract_bytes(image_bytes: bytes):
@@ -404,7 +416,7 @@ def pick_voice_for_language(lang_code: str, default_voice: str) -> str:
     if l.startswith("en-in"):
         return "en-IN-NeerjaNeural"
     if l.startswith("en"):
-        return "en-US-AriaNeural"
+        return "en-IN-AaravNeural"
     if l.startswith("bn"):
         return "bn-IN-BashkarNeural"
     if l.startswith("ta"):
@@ -475,20 +487,24 @@ if run:
     with st.expander("🔎 OCR extracted text"):
         st.write(raw_text[:20000] if raw_text else "(empty)")
 
+    # -------- Language auto-detect (hi/en) --------
+    target_lang = detect_hi_or_en(raw_text)
+    st.info(f"Target language (auto): **{target_lang}**")
+
     # -------- Summarize with GPT into JSON (s1..s6 + s1alt..s6alt) --------
-    system_prompt = """
+    system_prompt = f"""
 You are a multilingual teaching assistant.
 
 INPUT:
 - You will receive raw OCR text from a notes image.
 
 MANDATORY:
-- Detect the PRIMARY language in the OCR text (e.g., hi, en, bn, ta, te, mr, gu, kn, pa). Use a short BCP-47/ISO code when possible (e.g., "hi", "en", "en-IN").
-- Produce ALL text fields strictly in that same language.
+- Target language = "{target_lang}" (use concise BCP-47 like "en" or "hi").
+- Produce ALL text fields strictly in the Target language.
 
 Your job:
-1) Extract a short and catchy title → storytitle (in detected language)
-2) Summarise the content into 6 slides (s1paragraph1..s6paragraph1), each ≤ 400 characters (in detected language).
+1) Extract a short and catchy title → storytitle (Target language)
+2) Summarise the content into 6 slides (s1paragraph1..s6paragraph1), each ≤ 400 characters (Target language).
 3) For each paragraph (including slide 1), write a DALL·E prompt (s1alt1..s6alt1) for a 1024x1024 flat vector illustration: bright colors, clean lines, no text/captions/logos. (Prompts must not request text in the image.)
 
 SAFETY & POSITIVITY RULES (MANDATORY):
@@ -498,9 +514,9 @@ SAFETY & POSITIVITY RULES (MANDATORY):
 - Never include real people’s likeness or sensitive groups in a negative way.
 - Avoid slogans, gestures, flags, trademarks, or captions. Absolutely NO TEXT in the image.
 
-Respond strictly in this JSON format (keys in English; values in detected language):
-{
-  "language": "hi",
+Respond strictly in this JSON format (keys in English; values in Target language):
+{{
+  "language": "{target_lang}",
   "storytitle": "...",
   "s1paragraph1": "...",
   "s2paragraph1": "...",
@@ -514,7 +530,7 @@ Respond strictly in this JSON format (keys in English; values in detected langua
   "s4alt1": "...",
   "s5alt1": "...",
   "s6alt1": "..."
-}
+}}
 """
     messages = [
         {"role": "system", "content": system_prompt},
@@ -522,7 +538,7 @@ Respond strictly in this JSON format (keys in English; values in detected langua
     ]
 
     with st.spinner("Summarizing OCR text with Azure OpenAI…"):
-        ok, content = call_azure_chat(messages, temperature=0.2, max_tokens=1800, force_json=True)
+        ok, content = call_azure_chat(messages, temperature=0.0, max_tokens=1800, force_json=True)
         if not ok:
             st.error(content)
             st.stop()
@@ -540,8 +556,10 @@ Respond strictly in this JSON format (keys in English; values in detected langua
             st.error("Model did not return a valid JSON object.\n\nRaw reply (truncated):\n" + content[:800])
             st.stop()
 
-    detected_lang = str(result.get("language") or "").strip()
-    st.info(f"Detected language: **{detected_lang or '(not provided)'}**")
+    # Enforce target language in parsed result
+    result["language"] = target_lang
+    detected_lang = target_lang
+    st.info(f"Detected/target language: **{detected_lang}**")
 
     # Keep OCR text too (handy for debugging or templates)
     result["ocr_text"] = raw_text
