@@ -51,7 +51,7 @@ AZURE_DI_ENDPOINT = get_secret("AZURE_DI_ENDPOINT")  # https://<your-di>.cogniti
 AZURE_DI_KEY      = get_secret("AZURE_DI_KEY")
 
 # Azure DALL·E (Images)
-DALE_ENDPOINT     = get_secret("DALE_ENDPOINT")  # e.g. https://<...>/openai/deployments/dall-e-3/images/generations?api-version=2024-02-01
+DALE_ENDPOINT     = get_secret("DALE_ENDPOINT")  # e.g. https://.../openai/deployments/dall-e-3/images/generations?api-version=2024-02-01
 DAALE_KEY         = get_secret("DAALE_KEY")
 
 # AWS S3
@@ -61,15 +61,15 @@ AWS_REGION        = get_secret("AWS_REGION", "ap-south-1")
 AWS_BUCKET        = get_secret("AWS_BUCKET", "suvichaarapp")  # default to suvichaarapp
 S3_PREFIX         = get_secret("S3_PREFIX", "media")          # used for images/audio
 
-# HTML upload prefix + CDN base (for HTML)
-HTML_S3_PREFIX    = get_secret("HTML_S3_PREFIX", "webstory-html")
-CDN_HTML_BASE     = get_secret("CDN_HTML_BASE", "https://stories.suvichaar.org/webstory-html/")
+# HTML upload (ROOT of bucket) + CDN base (for HTML/JSON)
+HTML_S3_PREFIX    = get_secret("HTML_S3_PREFIX", "")  # empty = root
+CDN_HTML_BASE     = get_secret("CDN_HTML_BASE", "https://stories.suvichaar.org/")
 
 # CDN image handler prefix (base64-encoded template)
-CDN_PREFIX_MEDIA  = get_secret("CDN_PREFIX_MEDIA", "https://stories.suvichaar.org/")
+CDN_PREFIX_MEDIA  = get_secret("CDN_PREFIX_MEDIA", "https://media.suvichaar.org/")
 
 # Fallback image
-DEFAULT_ERROR_IMAGE = get_secret("DEFAULT_ERROR_IMAGE", "https://stories.suvichaar.org/default-error.jpg")
+DEFAULT_ERROR_IMAGE = get_secret("DEFAULT_ERROR_IMAGE", "https://media.suvichaar.org/default-error.jpg")
 
 # Azure Speech (TTS)
 AZURE_SPEECH_KEY     = get_secret("AZURE_SPEECH_KEY")
@@ -444,6 +444,15 @@ def fill_template_strict(template: str, data: dict):
         template = template.replace(f"{{{{{k}}}}}", str(v))
     return template, placeholders
 
+# ---- tiny helpers for root uploads/URLs ----
+def _s3_key(name: str) -> str:
+    """Join optional prefix + filename; if prefix is empty, just filename."""
+    return name if not HTML_S3_PREFIX else f"{HTML_S3_PREFIX.rstrip('/')}/{name}"
+
+def _cdn_url(name: str) -> str:
+    """CDN base + filename (no folder on CDN)."""
+    return f"{CDN_HTML_BASE.rstrip('/')}/{name}"
+
 # ---------------------------
 # UI
 # ---------------------------
@@ -699,7 +708,6 @@ Respond strictly in this JSON format (keys in English; values in Target language
         st.success("✅ Templates filled.")
 
         # Local download buttons (optional)
-        # Download JSON (local)
         json_name = f"{base_name}_{ts}.json"
         buf = io.StringIO()
         json.dump(merged, buf, ensure_ascii=False, indent=2)
@@ -732,7 +740,7 @@ Respond strictly in this JSON format (keys in English; values in Target language
                 mime="application/zip"
             )
 
-        # ---------- NEW: Upload JSON + HTML to S3 and show CDN URLs ----------
+        # ---------- Upload JSON + HTML to S3 (bucket root) and show CDN URLs ----------
         st.subheader("🌐 Uploaded to CDN")
         s3 = boto3.client(
             "s3",
@@ -743,9 +751,10 @@ Respond strictly in this JSON format (keys in English; values in Target language
 
         uploaded_urls = []
 
-        # 1) Upload JSON (optional but useful)
+        # 1) Upload JSON
         try:
-            json_key = f"{HTML_S3_PREFIX.rstrip('/')}/{base_name}_{ts}.json"
+            json_filename = f"{base_name}_{ts}.json"
+            json_key = _s3_key(json_filename)
             s3.put_object(
                 Bucket=AWS_BUCKET,
                 Key=json_key,
@@ -753,7 +762,7 @@ Respond strictly in this JSON format (keys in English; values in Target language
                 ContentType="application/json",
                 CacheControl="public, max-age=300"
             )
-            json_cdn_url = f"{CDN_HTML_BASE.rstrip('/')}/{base_name}_{ts}.json"
+            json_cdn_url = _cdn_url(json_filename)
             uploaded_urls.append(("JSON", json_cdn_url))
         except Exception as e:
             st.error(f"Failed to upload JSON to S3: {e}")
@@ -761,7 +770,7 @@ Respond strictly in this JSON format (keys in English; values in Target language
         # 2) Upload each HTML file
         for name, html in filled_items:
             try:
-                html_key = f"{HTML_S3_PREFIX.rstrip('/')}/{name}"
+                html_key = _s3_key(name)
                 s3.put_object(
                     Bucket=AWS_BUCKET,
                     Key=html_key,
@@ -769,7 +778,7 @@ Respond strictly in this JSON format (keys in English; values in Target language
                     ContentType="text/html; charset=utf-8",
                     CacheControl="public, max-age=300"
                 )
-                html_cdn_url = f"{CDN_HTML_BASE.rstrip('/')}/{name}"
+                html_cdn_url = _cdn_url(name)
                 uploaded_urls.append(("HTML", html_cdn_url))
             except Exception as e:
                 st.error(f"Failed to upload HTML to S3 ({name}): {e}")
