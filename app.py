@@ -585,7 +585,7 @@ Respond strictly in this JSON format (keys in English; values in detected langua
 
         # Map paragraphs to audio fields (s1..s6 paragraphs)
         field_mapping = {
-            "s1paragraph1":  "s1audio1",
+            "storytitle":  "s1audio1",
             "s2paragraph1":  "s2audio1",
             "s3paragraph1":  "s3audio1",
             "s4paragraph1":  "s4audio1",
