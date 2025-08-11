@@ -870,7 +870,7 @@ Respond strictly in this JSON format (keys in English; values in Target language
                     cdn_choice = st.selectbox("Select uploaded CDN URL to preview", uploaded_html_urls, index=0)
                     # Use an iframe to display remote page
                     iframe = f'''
-                        <iframe src="{cdn_choice}" width="100%" height="800" style="border:0;"></iframe>
+                        <iframe src="{cdn_choice}" width="1600" height="800" style="border:0;"></iframe>
                     '''
                     st_html(iframe, height=820, scrolling=False)
 
