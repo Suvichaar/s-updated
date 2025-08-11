@@ -9,6 +9,7 @@ import boto3
 import zipfile
 from io import BytesIO
 from datetime import datetime
+from pathlib import Path
 from PIL import Image
 import streamlit as st
 
@@ -29,7 +30,7 @@ st.set_page_config(
     layout="centered"
 )
 st.title("🧠 Suvichaar Builder")
-st.caption("OCR (Doc Intelligence) → GPT JSON → DALL·E → S3/CDN → (optional) SEO/TTS → Fill HTML templates → Download")
+st.caption("OCR (Doc Intelligence) → GPT JSON → DALL·E → S3/CDN → (optional) SEO/TTS → Fill HTML templates → Upload & Verify")
 
 # ---------------------------
 # Secrets / Config
@@ -55,11 +56,13 @@ DALE_ENDPOINT     = get_secret("DALE_ENDPOINT")  # e.g. https://.../openai/deplo
 DAALE_KEY         = get_secret("DAALE_KEY")
 
 # AWS S3
-AWS_ACCESS_KEY    = get_secret("AWS_ACCESS_KEY")
-AWS_SECRET_KEY    = get_secret("AWS_SECRET_KEY")
-AWS_REGION        = get_secret("AWS_REGION", "ap-south-1")
-AWS_BUCKET        = get_secret("AWS_BUCKET", "suvichaarapp")  # default to suvichaarapp
-S3_PREFIX         = get_secret("S3_PREFIX", "media")          # used for images/audio
+AWS_ACCESS_KEY        = get_secret("AWS_ACCESS_KEY")
+AWS_SECRET_KEY        = get_secret("AWS_SECRET_KEY")
+AWS_SESSION_TOKEN     = get_secret("AWS_SESSION_TOKEN")  # optional (for temporary creds)
+AWS_REGION            = get_secret("AWS_REGION", "ap-south-1")
+AWS_BUCKET            = get_secret("AWS_BUCKET", "suvichaarapp")  # default to suvichaarapp
+S3_PREFIX             = get_secret("S3_PREFIX", "media")          # used for images/audio
+USE_PUBLIC_READ_ACL   = bool(get_secret("USE_PUBLIC_READ_ACL", False))
 
 # ---- Hard-lock HTML/JSON at bucket ROOT + root CDN base (ignore secrets to prevent /webstory-html) ----
 HTML_S3_PREFIX = ""  # DO NOT CHANGE: empty = bucket root
@@ -93,7 +96,53 @@ if missing_core:
     st.warning("Add these secrets in `.streamlit/secrets.toml`: " + ", ".join(missing_core))
 
 # ---------------------------
-# Helpers
+# AWS helpers (robust client + verified uploads)
+# ---------------------------
+@st.cache_resource(show_spinner=False)
+def get_s3_client():
+    kwargs = dict(
+        aws_access_key_id=AWS_ACCESS_KEY,
+        aws_secret_access_key=AWS_SECRET_KEY,
+        region_name=AWS_REGION,
+    )
+    if AWS_SESSION_TOKEN:
+        kwargs["aws_session_token"] = AWS_SESSION_TOKEN
+    return boto3.client("s3", **kwargs)
+
+
+def s3_put_text_file(bucket: str, key: str, body: bytes, content_type: str, cache_control: str = "public, max-age=300"):
+    """Upload a small text file and verify it exists by HEADing it back.
+    Returns a dict: {"ok": bool, "etag": str|None, "key": str, "len": int, "error": str|None}
+    """
+    s3 = get_s3_client()
+    put_args = {
+        "Bucket": bucket,
+        "Key": key,
+        "Body": body,
+        "ContentType": content_type,
+        "CacheControl": cache_control,
+    }
+    if USE_PUBLIC_READ_ACL:
+        put_args["ACL"] = "public-read"
+
+    try:
+        s3.put_object(**put_args)
+    except Exception as e:
+        return {"ok": False, "etag": None, "key": key, "len": len(body), "error": f"put_object failed: {e}"}
+
+    # Verify via HEAD
+    try:
+        head = s3.head_object(Bucket=bucket, Key=key)
+        etag = head.get("ETag", "").strip('"')
+        cl = int(head.get("ContentLength", 0))
+        ok = cl == len(body)
+        return {"ok": ok, "etag": etag, "key": key, "len": cl, "error": None if ok else f"size mismatch {cl}!={len(body)}"}
+    except Exception as e:
+        return {"ok": False, "etag": None, "key": key, "len": 0, "error": f"head_object failed: {e}"}
+
+
+# ---------------------------
+# Other helpers
 # ---------------------------
 def build_resized_cdn_url(bucket: str, key_path: str, width: int, height: int) -> str:
     """Return base64-encoded template URL for your Serverless Image Handler."""
@@ -125,6 +174,7 @@ def robust_parse_model_json(raw_reply: str):
             except Exception:
                 parsed = None
     return parsed if isinstance(parsed, dict) else None
+
 
 def repair_json_with_model(raw_reply: str, chat_url: str, headers: dict):
     """Ask the model to fix its own output into valid JSON per schema; returns dict or None."""
@@ -168,6 +218,7 @@ Return ONLY valid JSON, no code fences, no commentary.
         return robust_parse_model_json(fixed)
     except Exception:
         return None
+
 
 def call_azure_chat(messages, *, temperature=0.2, max_tokens=1800, force_json=True):
     """Call Azure Chat (JSON mode default). Returns (ok, content_or_err)."""
@@ -273,18 +324,14 @@ def sanitize_prompt(chat_url: str, headers: dict, original_prompt: str) -> str:
             "\nFlat vector illustration, bright colors, no text, no logos, no brands, "
             "no real persons, family-friendly, inclusive, peaceful.")
 
+
 def generate_and_upload_images(result_json: dict) -> dict:
     """Generate DALL·E images, upload originals to S3, return CDN resized URLs in JSON."""
     if not all([DALE_ENDPOINT, DAALE_KEY, AWS_ACCESS_KEY, AWS_SECRET_KEY, AWS_BUCKET]):
         st.error("Missing DALL·E and/or AWS S3 secrets.")
         return {**result_json}
 
-    s3 = boto3.client(
-        "s3",
-        aws_access_key_id=AWS_ACCESS_KEY,
-        aws_secret_access_key=AWS_SECRET_KEY,
-        region_name=AWS_REGION
-    )
+    s3 = get_s3_client()
 
     slug = (
         (result_json.get("storytitle") or "story")
@@ -333,7 +380,10 @@ def generate_and_upload_images(result_json: dict) -> dict:
                 img_data = requests.get(image_url, timeout=120).content
                 buffer = BytesIO(img_data)  # upload original; no local resize
                 key = f"{S3_PREFIX.rstrip('/')}/{slug}/slide{i}.jpg"
-                s3.upload_fileobj(buffer, AWS_BUCKET, key, ExtraArgs={"ContentType": "image/jpeg"})
+                extra_args = {"ContentType": "image/jpeg"}
+                if USE_PUBLIC_READ_ACL:
+                    extra_args["ACL"] = "public-read"
+                s3.upload_fileobj(buffer, AWS_BUCKET, key, ExtraArgs=extra_args)
                 if i == 1:
                     first_slide_key = key
 
@@ -368,6 +418,7 @@ def generate_and_upload_images(result_json: dict) -> dict:
         out["potraightcoverurl"] = DEFAULT_ERROR_IMAGE
 
     return out
+
 
 def generate_seo_metadata(chat_url: str, headers: dict, result_json: dict, lang_code: str):
     """Ask the model for SEO metadata in the detected language."""
@@ -410,6 +461,7 @@ Respond strictly in this JSON format:
     except Exception:
         return "Explore this insightful story.", "web story, inspiration"
 
+
 def pick_voice_for_language(lang_code: str, default_voice: str) -> str:
     """Map detected language → Azure voice name."""
     if not lang_code:
@@ -437,6 +489,7 @@ def pick_voice_for_language(lang_code: str, default_voice: str) -> str:
         return "pa-IN-GeetikaNeural"
     return default_voice
 
+
 def fill_template_strict(template: str, data: dict):
     """Replace {{key}} with string(value). Also return placeholders detected (for missing-report)."""
     placeholders = set(re.findall(r"\{\{\s*([a-zA-Z0-9_\-]+)\s*\}\}", template))
@@ -448,6 +501,7 @@ def fill_template_strict(template: str, data: dict):
 def _s3_key(name: str) -> str:
     """Always just filename (bucket root)."""
     return name  # HTML_S3_PREFIX is hard-locked to ""
+
 
 def _cdn_url(name: str) -> str:
     """CDN base + filename at root."""
@@ -602,12 +656,7 @@ Respond strictly in this JSON format (keys in English; values in Target language
                      f"Import error: {e}")
             st.stop()
 
-        s3 = boto3.client(
-            "s3",
-            aws_access_key_id=AWS_ACCESS_KEY,
-            aws_secret_access_key=AWS_SECRET_KEY,
-            region_name=AWS_REGION
-        )
+        s3 = get_s3_client()
 
         chosen_voice = pick_voice_for_language(detected_lang, VOICE_NAME_DEFAULT)
         speech_config = speechsdk.SpeechConfig(subscription=AZURE_SPEECH_KEY, region=AZURE_SPEECH_REGION)
@@ -640,7 +689,10 @@ Respond strictly in this JSON format (keys in English; values in Target language
                     from azure.cognitiveservices.speech import ResultReason
                     if result_tts.reason == ResultReason.SynthesizingAudioCompleted:
                         s3_key = f"{S3_PREFIX.rstrip('/')}/audio/{uuid_name}"
-                        s3.upload_file(uuid_name, AWS_BUCKET, s3_key, ExtraArgs={"ContentType": "audio/mpeg"})
+                        extra_args = {"ContentType": "audio/mpeg"}
+                        if USE_PUBLIC_READ_ACL:
+                            extra_args["ACL"] = "public-read"
+                        get_s3_client().upload_file(uuid_name, AWS_BUCKET, s3_key, ExtraArgs=extra_args)
                         cdn_url = f"{CDN_BASE.rstrip('/')}/{s3_key}"
                         final_json[audio_key] = cdn_url
                         created_audio[field] = cdn_url
@@ -687,7 +739,8 @@ Respond strictly in this JSON format (keys in English; values in Target language
 
             for f in html_files:
                 try:
-                    html_text = f.read().decode("utf-8")
+                    raw_bytes = f.read()
+                    html_text = raw_bytes.decode("utf-8")
                 except Exception:
                     st.error(f"Could not read {f.name} as UTF-8.")
                     continue
@@ -697,7 +750,9 @@ Respond strictly in this JSON format (keys in English; values in Target language
                 if missing:
                     per_file_reports.append((f.name, missing))
 
-                out_filename = f"{base_name}_{ts}.html"
+                # ✅ make output filenames unique per template (prevents overwrite)
+                stem = Path(f.name).stem
+                out_filename = f"{stem}_{base_name}_{ts}.html"
                 filled_items.append((out_filename, filled))
 
         if per_file_reports:
@@ -740,55 +795,49 @@ Respond strictly in this JSON format (keys in English; values in Target language
                 mime="application/zip"
             )
 
-        # ---------- Upload JSON + HTML to S3 (bucket root) and show CDN URLs ----------
-        st.subheader("🌐 Uploaded to CDN")
-        s3 = boto3.client(
-            "s3",
-            aws_access_key_id=AWS_ACCESS_KEY,
-            aws_secret_access_key=AWS_SECRET_KEY,
-            region_name=AWS_REGION
-        )
-
+        # ---------- Upload JSON + HTML to S3 (bucket root) and VERIFY ----------
+        st.subheader("🌐 Upload to S3 + Verification")
         uploaded_urls = []
+        verifications = []
 
-        # 1) Upload JSON
-        try:
-            json_filename = f"{base_name}_{ts}.json"
-            json_key = _s3_key(json_filename)  # root
-            s3.put_object(
-                Bucket=AWS_BUCKET,
-                Key=json_key,
-                Body=json_str.encode("utf-8"),
-                ContentType="application/json",
-                CacheControl="public, max-age=300"
-            )
-            json_cdn_url = _cdn_url(json_filename)  # https://stories.suvichaar.org/<file>.json
+        # 1) Upload JSON (root)
+        json_filename = f"{base_name}_{ts}.json"
+        json_key = _s3_key(json_filename)  # root
+        res_json = s3_put_text_file(
+            bucket=AWS_BUCKET,
+            key=json_key,
+            body=json_str.encode("utf-8"),
+            content_type="application/json"
+        )
+        if res_json["ok"]:
+            json_cdn_url = _cdn_url(json_filename)
             uploaded_urls.append(("JSON", json_cdn_url))
-        except Exception as e:
-            st.error(f"Failed to upload JSON to S3: {e}")
+        verifications.append({"file": json_filename, **res_json})
 
-        # 2) Upload each HTML file
+        # 2) Upload each HTML file (root) and verify
         for name, html in filled_items:
-            try:
-                html_key = _s3_key(name)  # root
-                s3.put_object(
-                    Bucket=AWS_BUCKET,
-                    Key=html_key,
-                    Body=html.encode("utf-8"),
-                    ContentType="text/html; charset=utf-8",
-                    CacheControl="public, max-age=300"
-                )
+            html_key = _s3_key(name)
+            res_html = s3_put_text_file(
+                bucket=AWS_BUCKET,
+                key=html_key,
+                body=html.encode("utf-8"),
+                content_type="text/html; charset=utf-8"
+            )
+            if res_html["ok"]:
                 html_cdn_url = _cdn_url(name)  # https://stories.suvichaar.org/<file>.html
                 uploaded_urls.append(("HTML", html_cdn_url))
-            except Exception as e:
-                st.error(f"Failed to upload HTML to S3 ({name}): {e}")
+            verifications.append({"file": name, **res_html})
 
+        # Show results
         if uploaded_urls:
             for kind, url in uploaded_urls:
                 st.markdown(f"- **{kind}**: {url}")
-            st.success("✅ Files uploaded to S3 and accessible via CDN.")
+        st.json({"s3_verification": verifications}, expanded=False)
+
+        if uploaded_urls and all(v.get("ok") for v in verifications):
+            st.success("✅ Files uploaded to S3 and verified via HEAD. CDN should serve them at the URLs above (allow a short cache/propagation delay).")
         else:
-            st.error("No files were uploaded to the CDN. Check AWS credentials and bucket permissions.")
+            st.error("Some uploads failed or could not be verified. Check the errors above — common issues: wrong bucket name, IAM permissions (s3:PutObject, s3:PutObjectAcl, s3:HeadObject), or Public Access Block.")
 
         # Optional preview
         show_preview = st.checkbox("Show preview of first filled template", value=False)
