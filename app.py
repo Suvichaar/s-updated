@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from PIL import Image
 import streamlit as st
+from streamlit.components.v1 import html as st_html  # <-- for live HTML preview
 
 # --- Azure Doc Intelligence SDK ---
 try:
@@ -139,7 +140,6 @@ def s3_put_text_file(bucket: str, key: str, body: bytes, content_type: str, cach
         return {"ok": ok, "etag": etag, "key": key, "len": cl, "error": None if ok else f"size mismatch {cl}!={len(body)}"}
     except Exception as e:
         return {"ok": False, "etag": None, "key": key, "len": 0, "error": f"head_object failed: {e}"}
-
 
 # ---------------------------
 # Other helpers
@@ -839,7 +839,42 @@ Respond strictly in this JSON format (keys in English; values in Target language
         else:
             st.error("Some uploads failed or could not be verified. Check the errors above — common issues: wrong bucket name, IAM permissions (s3:PutObject, s3:PutObjectAcl, s3:HeadObject), or Public Access Block.")
 
-        # Optional preview
-        show_preview = st.checkbox("Show preview of first filled template", value=False)
+        # ---------------------------
+        # FINAL: Live HTML Preview (at the very end)
+        # ---------------------------
+        st.markdown("### 👀 Live HTML Preview")
+        if not filled_items:
+            st.info("No filled templates available to preview.")
+        else:
+            # Collect uploaded HTML URLs (if any)
+            uploaded_html_urls = [u for (k, u) in uploaded_urls if k == "HTML"]
+
+            preview_source = st.radio(
+                "Choose preview source",
+                options=["Local filled HTML", "Uploaded CDN URL"],
+                index=0 if filled_items else 1,
+                horizontal=True
+            )
+
+            if preview_source == "Local filled HTML":
+                # Show a select for local HTMLs
+                names = [name for name, _ in filled_items]
+                choice = st.selectbox("Select local HTML to preview", names, index=0)
+                chosen_html = next(html for (name, html) in filled_items if name == choice)
+                # Render the HTML directly
+                st_html(chosen_html, height=800, scrolling=True)
+            else:
+                if not uploaded_html_urls:
+                    st.info("No uploaded HTML URLs found yet. Upload step might have failed.")
+                else:
+                    cdn_choice = st.selectbox("Select uploaded CDN URL to preview", uploaded_html_urls, index=0)
+                    # Use an iframe to display remote page
+                    iframe = f'''
+                        <iframe src="{cdn_choice}" width="100%" height="800" style="border:0;"></iframe>
+                    '''
+                    st_html(iframe, height=820, scrolling=False)
+
+        # (optional) keep your minimal code preview toggle
+        show_preview = st.checkbox("Show raw HTML code of first filled template", value=False)
         if show_preview and filled_items:
             st.code(filled_items[0][1][:5000], language="html")
