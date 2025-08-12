@@ -63,10 +63,9 @@ AWS_SESSION_TOKEN     = get_secret("AWS_SESSION_TOKEN")  # optional (for tempora
 AWS_REGION            = get_secret("AWS_REGION", "ap-south-1")
 AWS_BUCKET            = get_secret("AWS_BUCKET", "suvichaarapp")  # default to suvichaarapp
 S3_PREFIX             = get_secret("S3_PREFIX", "media")          # used for images/audio
-USE_PUBLIC_READ_ACL   = bool(get_secret("USE_PUBLIC_READ_ACL", False))
 
-# ---- Hard-lock HTML/JSON at bucket ROOT + root CDN base (ignore secrets to prevent /webstory-html) ----
-HTML_S3_PREFIX = ""  # DO NOT CHANGE: empty = bucket root
+# ---- Hard-lock HTML/JSON at bucket ROOT + root CDN base (no /webstory-html) ----
+HTML_S3_PREFIX = ""  # bucket root
 CDN_HTML_BASE  = "https://stories.suvichaar.org/"
 
 # CDN image handler prefix (base64-encoded template)
@@ -111,7 +110,7 @@ def get_s3_client():
     return boto3.client("s3", **kwargs)
 
 
-def s3_put_text_file(bucket: str, key: str, body: bytes, content_type: str, cache_control: str = "public, max-age=300"):
+def s3_put_text_file(bucket: str, key: str, body: bytes, content_type: str, cache_control: str = "public, max-age=31536000, immutable"):
     """Upload a small text file and verify it exists by HEADing it back.
     Returns a dict: {"ok": bool, "etag": str|None, "key": str, "len": int, "error": str|None}
     """
@@ -123,8 +122,6 @@ def s3_put_text_file(bucket: str, key: str, body: bytes, content_type: str, cach
         "ContentType": content_type,
         "CacheControl": cache_control,
     }
-    if USE_PUBLIC_READ_ACL:
-        put_args["ACL"] = "public-read"
 
     try:
         s3.put_object(**put_args)
@@ -381,8 +378,7 @@ def generate_and_upload_images(result_json: dict) -> dict:
                 buffer = BytesIO(img_data)  # upload original; no local resize
                 key = f"{S3_PREFIX.rstrip('/')}/{slug}/slide{i}.jpg"
                 extra_args = {"ContentType": "image/jpeg"}
-                if USE_PUBLIC_READ_ACL:
-                    extra_args["ACL"] = "public-read"
+                # No ACL
                 s3.upload_fileobj(buffer, AWS_BUCKET, key, ExtraArgs=extra_args)
                 if i == 1:
                     first_slide_key = key
@@ -436,10 +432,10 @@ Slides:
 - {result_json.get("s6paragraph1","")}
 
 Respond strictly in this JSON format:
-{{
+{
   "metadescription": "...",
   "metakeywords": "keyword1, keyword2, ..."
-}}
+}
 """
     payload_seo = {
         "messages": [
@@ -500,7 +496,7 @@ def fill_template_strict(template: str, data: dict):
 # ---- helpers for root uploads/URLs (hard-locked) ----
 def _s3_key(name: str) -> str:
     """Always just filename (bucket root)."""
-    return name  # HTML_S3_PREFIX is hard-locked to ""
+    return name  # HTML S3 uploads at root
 
 
 def _cdn_url(name: str) -> str:
@@ -582,7 +578,7 @@ SAFETY & POSITIVITY RULES (MANDATORY):
 - Avoid slogans, gestures, flags, trademarks, or captions. Absolutely NO TEXT in the image.
 
 Respond strictly in this JSON format (keys in English; values in Target language):
-{{
+{
   "language": "{target_lang}",
   "storytitle": "...",
   "s1paragraph1": "...",
@@ -597,7 +593,7 @@ Respond strictly in this JSON format (keys in English; values in Target language
   "s4alt1": "...",
   "s5alt1": "...",
   "s6alt1": "..."
-}}
+}
 """
     messages = [
         {"role": "system", "content": system_prompt},
@@ -690,8 +686,7 @@ Respond strictly in this JSON format (keys in English; values in Target language
                     if result_tts.reason == ResultReason.SynthesizingAudioCompleted:
                         s3_key = f"{S3_PREFIX.rstrip('/')}/audio/{uuid_name}"
                         extra_args = {"ContentType": "audio/mpeg"}
-                        if USE_PUBLIC_READ_ACL:
-                            extra_args["ACL"] = "public-read"
+                        # No ACL
                         get_s3_client().upload_file(uuid_name, AWS_BUCKET, s3_key, ExtraArgs=extra_args)
                         cdn_url = f"{CDN_BASE.rstrip('/')}/{s3_key}"
                         final_json[audio_key] = cdn_url
@@ -837,7 +832,7 @@ Respond strictly in this JSON format (keys in English; values in Target language
         if uploaded_urls and all(v.get("ok") for v in verifications):
             st.success("✅ Files uploaded to S3 and verified via HEAD. CDN should serve them at the URLs above (allow a short cache/propagation delay).")
         else:
-            st.error("Some uploads failed or could not be verified. Check the errors above — common issues: wrong bucket name, IAM permissions (s3:PutObject, s3:PutObjectAcl, s3:HeadObject), or Public Access Block.")
+            st.error("Some uploads failed or could not be verified. Check the errors above — common issues: wrong bucket name, IAM permissions (s3:PutObject and s3:HeadObject), or Public Access Block.")
 
         # ---------------------------
         # FINAL: Live HTML Preview (at the very end)
