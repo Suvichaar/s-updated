@@ -66,7 +66,7 @@ S3_PREFIX             = get_secret("S3_PREFIX", "media")          # used for ima
 
 # ---- Hard-lock HTML/JSON at bucket ROOT + root CDN base (no /webstory-html) ----
 HTML_S3_PREFIX = ""  # bucket root
-CDN_HTML_BASE  = "https://stories.suvichaar.org/"
+CDN_HTML_BASE  = "https://cdn.suvichaar.org/"
 
 # CDN image handler prefix (base64-encoded template)
 CDN_PREFIX_MEDIA  = get_secret("CDN_PREFIX_MEDIA", "https://media.suvichaar.org/")
