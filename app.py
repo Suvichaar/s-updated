@@ -746,8 +746,13 @@ Respond strictly in this JSON format (keys in English; values in Target language
                     per_file_reports.append((f.name, missing))
 
                 # ✅ make output filenames unique per template (prevents overwrite)
-                stem = Path(f.name).stem
-                out_filename = f"{stem}_{base_name}_{ts}.html"
+                if len(html_files) == 1:
+                    out_filename = f"{base_name}_{ts}.html"
+                else:
+                    # keep same base, but add index so files don't overwrite each other
+                    # e.g., my_story_20250812_154233_1.html, my_story_20250812_154233_2.html
+                    idx = len(filled_items) + 1
+                    out_filename = f"{base_name}_{ts}_{idx}.html"
                 filled_items.append((out_filename, filled))
 
         if per_file_reports:
