@@ -432,11 +432,12 @@ Slides:
 - {result_json.get("s6paragraph1","")}
 
 Respond strictly in this JSON format:
-{
+{{
   "metadescription": "...",
   "metakeywords": "keyword1, keyword2, ..."
-}
+}}
 """
+
     payload_seo = {
         "messages": [
             {"role": "system", "content": "You are an expert SEO assistant. Answer ONLY with valid JSON."},
@@ -555,7 +556,7 @@ if run:
     st.info(f"Target language (auto): **{target_lang}**")
 
     # -------- Summarize with GPT into JSON (s1..s6 + s1alt..s6alt) --------
-    system_prompt = f"""
+   system_prompt = f"""
 You are a multilingual teaching assistant.
 
 INPUT:
@@ -578,7 +579,7 @@ SAFETY & POSITIVITY RULES (MANDATORY):
 - Avoid slogans, gestures, flags, trademarks, or captions. Absolutely NO TEXT in the image.
 
 Respond strictly in this JSON format (keys in English; values in Target language):
-{
+{{
   "language": "{target_lang}",
   "storytitle": "...",
   "s1paragraph1": "...",
@@ -593,7 +594,7 @@ Respond strictly in this JSON format (keys in English; values in Target language
   "s4alt1": "...",
   "s5alt1": "...",
   "s6alt1": "..."
-}
+}}
 """
     messages = [
         {"role": "system", "content": system_prompt},
