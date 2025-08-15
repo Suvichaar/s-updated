@@ -4,12 +4,13 @@ import re
 import json
 import time
 import base64
-import requests
-import boto3
 import zipfile
 from io import BytesIO
 from datetime import datetime
 from pathlib import Path
+
+import requests
+import boto3
 from PIL import Image
 import streamlit as st
 from streamlit.components.v1 import html as st_html  # <-- for live HTML preview
@@ -153,9 +154,9 @@ def build_resized_cdn_url(bucket: str, key_path: str, width: int, height: int) -
 
 SAFE_FALLBACK = (
     "A joyful, abstract geometric illustration symbolizing unity and learning — "
-    "soft shapes, harmonious gradients, friendly silhouettes, "
-    "no text, no logos, no brands, no real persons, family-friendly, "
-    "flat vector style, bright colors."
+    "soft shapes, harmonious gradients, friendly silhouettes; "
+    "flat vector style, bright colors; family-friendly; "
+    "no text, no logos, no watermarks, no real-person likeness."
 )
 
 def robust_parse_model_json(raw_reply: str):
@@ -294,6 +295,77 @@ def ocr_extract_bytes(image_bytes: bytes):
     except Exception as e:
         return False, f"Doc Intelligence error: {e}"
 
+# -------- NEW: Enrich alt prompts for better image generation --------
+def enrich_alt_prompts_with_model(result_json: dict, language: str) -> dict:
+    """
+    Turn s1..s6 'alt1' prompts into rich, safe, image-gen prompts using Azure Chat.
+    Returns a *new* dict with the same keys but improved alt prompts.
+    """
+    # If Azure config is missing, just return input unchanged
+    if not (AZURE_API_KEY and AZURE_ENDPOINT and AZURE_DEPLOYMENT and AZURE_API_VERSION):
+        return dict(result_json)
+
+    headers = {"Content-Type": "application/json", "api-key": AZURE_API_KEY}
+    chat_url = f"{AZURE_ENDPOINT.rstrip('/')}/openai/deployments/{AZURE_DEPLOYMENT}/chat/completions?api-version={AZURE_API_VERSION}"
+
+    sys_msg = (
+        "You are an art director who writes SINGLE, detailed prompts for image generation.\n"
+        "Return ONLY valid JSON with one key 'alt'.\n"
+        "The prompt must:\n"
+        "- Be in the requested language when relevant.\n"
+        "- Be a single paragraph (no lists), <= 1200 characters.\n"
+        "- Specify: subject(s), setting, composition (foreground/mid/background), camera/perspective, "
+        "lighting, color palette, mood/emotion, motion/action where relevant, style keywords.\n"
+        "- Enforce style: flat vector illustration, clean shapes, smooth gradients, crisp edges, "
+        "no text/captions/logos, no watermarks, no trademarks, no real-person likeness.\n"
+        "- Keep it family-friendly, safe, inclusive; replace unsafe content with abstract, peaceful motifs.\n"
+        "Output JSON ONLY: {\"alt\":\"...\"}"
+    )
+
+    improved = dict(result_json)
+    for i in range(1, 7):
+        base_alt = (result_json.get(f"s{i}alt1") or "").strip()
+        slide_txt = (result_json.get(f"s{i}paragraph1") or "").strip()
+        # If both are empty, skip
+        if not (base_alt or slide_txt):
+            continue
+
+        user_msg = (
+            f"Language: {language}\n"
+            f"Slide text (context): {slide_txt}\n"
+            f"Existing short prompt: {base_alt}\n\n"
+            "Write a SINGLE improved prompt in the JSON format described."
+        )
+        payload = {
+            "messages": [
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": user_msg}
+            ],
+            "temperature": 0.3,
+            "max_tokens": 700,
+            "response_format": {"type": "json_object"}
+        }
+
+        try:
+            r = requests.post(chat_url, headers=headers, json=payload, timeout=90)
+            if r.status_code == 200:
+                content = r.json()["choices"][0]["message"]["content"]
+                data = robust_parse_model_json(content)
+                if isinstance(data, dict) and data.get("alt"):
+                    improved[f"s{i}alt1"] = data["alt"]
+                    continue  # next slide
+        except Exception:
+            pass  # fall through to keep original
+
+        # Fallback: if enrichment fails, ensure at least safe guardrails on original
+        improved[f"s{i}alt1"] = (
+            (base_alt or slide_txt) +
+            " — flat vector illustration, clean geometric shapes, smooth gradients, harmonious palette, "
+            "inclusive and family-friendly; no text, no logos, no watermarks, no real-person likeness."
+        )
+
+    return improved
+
 # -------- Image generation + S3 upload --------
 def sanitize_prompt(chat_url: str, headers: dict, original_prompt: str) -> str:
     """Rewrite any risky prompt into a safe, positive, family-friendly version using Azure Chat."""
@@ -317,9 +389,12 @@ def sanitize_prompt(chat_url: str, headers: dict, original_prompt: str) -> str:
     except Exception as e:
         st.info(f"Sanitizer call failed; using local guards: {e}")
 
-    return (original_prompt +
-            "\nFlat vector illustration, bright colors, no text, no logos, no brands, "
-            "no real persons, family-friendly, inclusive, peaceful.")
+    # Toughened local fallback
+    return (
+        original_prompt +
+        " — flat vector illustration, clean geometric shapes, smooth gradients, harmonious palette, "
+        "inclusive and family-friendly; no text, no logos, no watermarks, no real-person likeness."
+    )
 
 
 def generate_and_upload_images(result_json: dict) -> dict:
@@ -630,6 +705,13 @@ Respond strictly in this JSON format (keys in English; values in Target language
     st.success("Structured JSON created from OCR.")
     st.json(result, expanded=False)
 
+    # -------- NEW: Enrich alt prompts (art-director pass) --------
+    with st.spinner("Enhancing image prompts (art-director pass)…"):
+        result = enrich_alt_prompts_with_model(result, detected_lang)
+        st.caption("Alt prompts enriched for subject, setting, composition, lighting, palette, style, perspective, mood.")
+        if st.checkbox("Show enriched alt prompts", value=False):
+            st.json({k: result[k] for k in result if re.match(r"s[1-6]alt1$", k)}, expanded=False)
+
     # -------- DALL·E images → S3 → CDN --------
     with st.spinner("Generating DALL·E images and uploading to S3…"):
         final_json = generate_and_upload_images(result)
@@ -750,7 +832,6 @@ Respond strictly in this JSON format (keys in English; values in Target language
                     out_filename = f"{base_name}_{ts}.html"
                 else:
                     # keep same base, but add index so files don't overwrite each other
-                    # e.g., my_story_20250812_154233_1.html, my_story_20250812_154233_2.html
                     idx = len(filled_items) + 1
                     out_filename = f"{base_name}_{ts}_{idx}.html"
                 filled_items.append((out_filename, filled))
@@ -824,7 +905,7 @@ Respond strictly in this JSON format (keys in English; values in Target language
                 content_type="text/html; charset=utf-8"
             )
             if res_html["ok"]:
-                html_cdn_url = _cdn_url(name)  # https://stories.suvichaar.org/<file>.html
+                html_cdn_url = _cdn_url(name)  # https://cdn.suvichaar.org/<file>.html
                 uploaded_urls.append(("HTML", html_cdn_url))
             verifications.append({"file": name, **res_html})
 
