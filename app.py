@@ -1,577 +1,961 @@
+import os
 import io
-import json
 import re
-import random
-import string
+import json
+import time
+import base64
+import zipfile
+from io import BytesIO
 from datetime import datetime
 from pathlib import Path
 
-import streamlit as st
-from streamlit.components.v1 import html as st_html  # inline HTML viewer
+import requests
+import boto3
 from PIL import Image
-from azure.core.credentials import AzureKeyCredential
-from azure.ai.documentintelligence import DocumentIntelligenceClient
-from openai import AzureOpenAI
-import boto3  # S3 upload
+import streamlit as st
+from streamlit.components.v1 import html as st_html  # <-- for live HTML preview
+
+# --- Azure Doc Intelligence SDK ---
+try:
+    from azure.ai.documentintelligence import DocumentIntelligenceClient
+    from azure.core.credentials import AzureKeyCredential
+except Exception:
+    DocumentIntelligenceClient = None  # we'll error nicely later
+    AzureKeyCredential = None
 
 # ---------------------------
-# Streamlit page config
+# Page config
 # ---------------------------
 st.set_page_config(
-    page_title="Notes → OCR → Quiz → AMP",
+    page_title="Suvichaar Builder",
     page_icon="🧠",
     layout="centered"
 )
-st.title("🧠 Notes/Quiz OCR → GPT Structuring → AMP Web Story")
-st.caption("Upload notes/quiz as image(s) or PDF(s), or provide a ready JSON + an AMP HTML template → download timestamped final HTML.")
+st.title("🧠 Suvichaar Builder")
+st.caption("OCR (Doc Intelligence) → GPT JSON → DALL·E → S3/CDN → (optional) SEO/TTS → Fill HTML templates → Upload & Verify")
 
 # ---------------------------
-# Secrets / Config (from st.secrets)
+# Secrets / Config
 # ---------------------------
-try:
-    # Azure
-    AZURE_DI_ENDPOINT = st.secrets["AZURE_DI_ENDPOINT"]      # https://<your-di>.cognitiveservices.azure.com/
-    AZURE_API_KEY = st.secrets["AZURE_API_KEY"]
+def get_secret(key, default=None):
+    try:
+        return st.secrets[key]
+    except Exception:
+        return default
 
-    AZURE_OPENAI_ENDPOINT = st.secrets["AZURE_OPENAI_ENDPOINT"]  # https://<your-openai>.openai.azure.com/
-    AZURE_OPENAI_API_VERSION = st.secrets.get("AZURE_OPENAI_API_VERSION", "2024-08-01-preview")
-    AZURE_OPENAI_API_KEY = st.secrets.get("AZURE_OPENAI_API_KEY", AZURE_API_KEY)  # reuse if same key
-    GPT_DEPLOYMENT = st.secrets.get("GPT_DEPLOYMENT", "gpt-4")  # your deployment name
+# Azure OpenAI (GPT)
+AZURE_API_KEY     = get_secret("AZURE_API_KEY")
+AZURE_ENDPOINT    = get_secret("AZURE_ENDPOINT")  # https://<resource>.openai.azure.com
+AZURE_DEPLOYMENT  = get_secret("AZURE_DEPLOYMENT", "gpt-4o")  # your *deployment* name
+AZURE_API_VERSION = get_secret("AZURE_API_VERSION", "2024-08-01-preview")
 
-    # AWS / S3
-    AWS_ACCESS_KEY_ID     = st.secrets["AWS_ACCESS_KEY_ID"]
-    AWS_SECRET_ACCESS_KEY = st.secrets["AWS_SECRET_ACCESS_KEY"]
-    AWS_REGION            = st.secrets.get("AWS_REGION", "ap-south-1")
-    AWS_BUCKET            = st.secrets.get("AWS_BUCKET", "suvichaarapp")
+# Azure Document Intelligence (OCR)
+AZURE_DI_ENDPOINT = get_secret("AZURE_DI_ENDPOINT")  # https://<your-di>.cognitiveservices.azure.com/
+AZURE_DI_KEY      = get_secret("AZURE_DI_KEY")
 
-    # HTML upload path + CDN
-    HTML_S3_PREFIX = st.secrets.get("HTML_S3_PREFIX", "webstory-html")
-    CDN_HTML_BASE  = st.secrets.get("CDN_HTML_BASE", "https://stories.suvichaar.org/")
-except Exception:
-    st.error("Missing secrets. Please set required Azure and AWS keys in .streamlit/secrets.toml")
-    st.stop()
+# Azure DALL·E (Images)
+DALE_ENDPOINT     = get_secret("DALE_ENDPOINT")  # e.g. https://.../openai/deployments/dall-e-3/images/generations?api-version=2024-02-01
+DAALE_KEY         = get_secret("DAALE_KEY")
+
+# AWS S3
+AWS_ACCESS_KEY        = get_secret("AWS_ACCESS_KEY")
+AWS_SECRET_KEY        = get_secret("AWS_SECRET_KEY")
+AWS_SESSION_TOKEN     = get_secret("AWS_SESSION_TOKEN")  # optional (for temporary creds)
+AWS_REGION            = get_secret("AWS_REGION", "ap-south-1")
+AWS_BUCKET            = get_secret("AWS_BUCKET", "suvichaarapp")  # default to suvichaarapp
+S3_PREFIX             = get_secret("S3_PREFIX", "media")          # used for images/audio
+
+# ---- Hard-lock HTML/JSON at bucket ROOT + root CDN base (no /webstory-html) ----
+HTML_S3_PREFIX = ""  # bucket root
+CDN_HTML_BASE  = "https://cdn.suvichaar.org/"
+
+# CDN image handler prefix (base64-encoded template)
+CDN_PREFIX_MEDIA  = get_secret("CDN_PREFIX_MEDIA", "https://media.suvichaar.org/")
+
+# Fallback image
+DEFAULT_ERROR_IMAGE = get_secret("DEFAULT_ERROR_IMAGE", "https://media.suvichaar.org/default-error.jpg")
+
+# Azure Speech (TTS)
+AZURE_SPEECH_KEY     = get_secret("AZURE_SPEECH_KEY")
+AZURE_SPEECH_REGION  = get_secret("AZURE_SPEECH_REGION", "eastus")
+VOICE_NAME_DEFAULT   = get_secret("VOICE_NAME", "hi-IN-AaravNeural")
+
+# CDN base for audio (CloudFront etc.)
+CDN_BASE             = get_secret("CDN_BASE", "https://cdn.suvichaar.org/")
+
+# Sanity checks (warn if missing)
+missing_core = []
+for k in [
+    "AZURE_API_KEY", "AZURE_ENDPOINT", "AZURE_DEPLOYMENT",
+    "AZURE_DI_ENDPOINT", "AZURE_DI_KEY",
+    "DALE_ENDPOINT", "DAALE_KEY",
+    "AWS_ACCESS_KEY", "AWS_SECRET_KEY", "AWS_BUCKET"
+]:
+    if not get_secret(k, None):
+        missing_core.append(k)
+if missing_core:
+    st.warning("Add these secrets in `.streamlit/secrets.toml`: " + ", ".join(missing_core))
 
 # ---------------------------
-# Clients
+# AWS helpers (robust client + verified uploads)
 # ---------------------------
-di_client = DocumentIntelligenceClient(
-    endpoint=AZURE_DI_ENDPOINT,
-    credential=AzureKeyCredential(AZURE_API_KEY)
-)
-
-gpt_client = AzureOpenAI(
-    api_key=AZURE_OPENAI_API_KEY,
-    api_version=AZURE_OPENAI_API_VERSION,
-    azure_endpoint=AZURE_OPENAI_ENDPOINT,
-)
-
+@st.cache_resource(show_spinner=False)
 def get_s3_client():
-    return boto3.client(
-        "s3",
+    kwargs = dict(
+        aws_access_key_id=AWS_ACCESS_KEY,
+        aws_secret_access_key=AWS_SECRET_KEY,
         region_name=AWS_REGION,
-        aws_access_key_id=AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
     )
+    if AWS_SESSION_TOKEN:
+        kwargs["aws_session_token"] = AWS_SESSION_TOKEN
+    return boto3.client("s3", **kwargs)
+
+
+def s3_put_text_file(bucket: str, key: str, body: bytes, content_type: str, cache_control: str = "public, max-age=31536000, immutable"):
+    """Upload a small text file and verify it exists by HEADing it back.
+    Returns a dict: {"ok": bool, "etag": str|None, "key": str, "len": int, "error": str|None}
+    """
+    s3 = get_s3_client()
+    put_args = {
+        "Bucket": bucket,
+        "Key": key,
+        "Body": body,
+        "ContentType": content_type,
+        "CacheControl": cache_control,
+    }
+
+    try:
+        s3.put_object(**put_args)
+    except Exception as e:
+        return {"ok": False, "etag": None, "key": key, "len": len(body), "error": f"put_object failed: {e}"}
+
+    # Verify via HEAD
+    try:
+        head = s3.head_object(Bucket=bucket, Key=key)
+        etag = head.get("ETag", "").strip('"')
+        cl = int(head.get("ContentLength", 0))
+        ok = cl == len(body)
+        return {"ok": ok, "etag": etag, "key": key, "len": cl, "error": None if ok else f"size mismatch {cl}!={len(body)}"}
+    except Exception as e:
+        return {"ok": False, "etag": None, "key": key, "len": 0, "error": f"head_object failed: {e}"}
 
 # ---------------------------
-# Prompts
+# Other helpers
 # ---------------------------
-SYSTEM_PROMPT_OCR_TO_QA = """
-You receive OCR text that already contains multiple-choice questions in Hindi or English.
-Each question has options (A)-(D), a single correct answer, and ideally an explanation.
+def build_resized_cdn_url(bucket: str, key_path: str, width: int, height: int) -> str:
+    """Return base64-encoded template URL for your Serverless Image Handler."""
+    template = {
+        "bucket": bucket,
+        "key": key_path,
+        "edits": {"resize": {"width": width, "height": height, "fit": "cover"}}
+    }
+    encoded = base64.urlsafe_b64encode(json.dumps(template).encode()).decode()
+    return f"{CDN_PREFIX_MEDIA}{encoded}"
 
-Return a JSON object:
+SAFE_FALLBACK = (
+    "A joyful, abstract geometric illustration symbolizing unity and learning — "
+    "soft shapes, harmonious gradients, friendly silhouettes; "
+    "flat vector style, bright colors; family-friendly; "
+    "no text, no logos, no watermarks, no real-person likeness."
+)
+
+def robust_parse_model_json(raw_reply: str):
+    """Parse model reply into a dict or return None."""
+    parsed = None
+    try:
+        parsed = json.loads(raw_reply)
+    except Exception:
+        m = re.search(r"\{[\s\S]*\}", raw_reply)
+        if m:
+            try:
+                parsed = json.loads(m.group(0))
+            except Exception:
+                parsed = None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def repair_json_with_model(raw_reply: str, chat_url: str, headers: dict):
+    """Ask the model to fix its own output into valid JSON per schema; returns dict or None."""
+    schema_hint = """
+Keys (English), values in detected language. If any field is missing, use an empty string:
 {
-  "questions": [
-    {
-      "question": "...",
-      "options": {"A":"...", "B":"...", "C":"...", "D":"..."},
-      "correct_option": "A" | "B" | "C" | "D",
-      "explanation": "..."
-    }
-  ]
+  "language": "hi|en|bn|ta|te|mr|gu|kn|pa|en-IN|...",
+  "storytitle": "...",
+  "s1paragraph1": "...",
+  "s2paragraph1": "...",
+  "s3paragraph1": "...",
+  "s4paragraph1": "...",
+  "s5paragraph1": "...",
+  "s6paragraph1": "...",
+  "s1alt1": "...",
+  "s2alt1": "...",
+  "s3alt1": "...",
+  "s4alt1": "...",
+  "s5alt1": "...",
+  "s6alt1": "..."
 }
-
-- If explanations are missing, write a concise 1–2 sentence explanation grounded in the text.
-- Preserve the original language (Hindi stays Hindi, English stays English).
-- Ensure valid JSON only.
+Return ONLY valid JSON, no code fences, no commentary.
 """
-
-SYSTEM_PROMPT_NOTES_TO_QA_BASE = """
-You are given raw study notes text (could be Hindi or English). Generate exactly FIVE high-quality
-multiple-choice questions (MCQs) that are strictly grounded in these notes.
-
-For each question:
-- Provide four options labeled A–D.
-- Ensure exactly one correct option.
-- Add a 1–2 sentence explanation that justifies the correct answer using the notes.
-
-Respond ONLY with valid JSON in this schema:
-{
-  "questions": [
-    {
-      "question": "...",
-      "options": {"A":"...", "B":"...", "C":"...", "D":"..."},
-      "correct_option": "A" | "B" | "C" | "D",
-      "explanation": "..."
-    }
-  ]
-}
-
-Language: Use the same language as the notes (auto-detect). Keep questions concise and unambiguous.
-"""
-
-SYSTEM_PROMPT_QA_TO_PLACEHOLDERS = """
-You are given a JSON object with key "questions": a list where each item has:
-- question (string)
-- options: {"A":..., "B":..., "C":..., "D":...}
-- correct_option (A/B/C/D)
-- explanation (string)
-
-Produce a single flat JSON object with EXACTLY these keys (sensible short defaults if missing).
-Use the SAME language as the input questions (auto-detect; Hindi → Hindi, English → English).
-
-pagetitle, storytitle, typeofquiz, potraitcoverurl,
-s1title1, s1text1,
-
-s2questionHeading, s2question1,
-s2option1, s2option1attr, s2option2, s2option2attr,
-s2option3, s2option3attr, s2option4, s2option4attr,
-s2attachment1,
-
-s3questionHeading, s3question1,
-s3option1, s3option1attr, s3option2, s3option2attr,
-s3option3, s3option3attr, s3option4, s3option4attr,
-s3attachment1,
-
-s4questionHeading, s4question1,
-s4option1, s4option1attr, s4option2, s4option2attr,
-s4option3, s4option3attr, s4option4, s4option4attr,
-s4attachment1,
-
-s5questionHeading, s5question1,
-s5option1, s5option1attr, s5option2, s5option2attr,
-s5option3, s5option3attr, s5option4, s5option4attr,
-s5attachment1,
-
-s6questionHeading, s6question1,
-s6option1, s6option1attr, s6option2, s6option2attr,
-s6option3, s6option3attr, s6option4, s6option4attr,
-s6attachment1,
-
-results_bg_image, results_prompt_text, results1_text, results2_text, results3_text
-
-Mapping rules:
-- We only need FIVE questions in the AMP template: map questions[0] → s2*, questions[1] → s3*, … questions[4] → s6*.
-- sNquestion1 ← questions[N-2].question  (N=2..6)
-- sNoption1..4 ← options A..D text
-- For the correct option, set sNoptionKattr to the string "correct"; for others set "".
-- sNattachment1 ← explanation for that question
-- sNquestionHeading ← "Question {N-1}" (or the language-appropriate equivalent; e.g., Hindi: "प्रश्न {N-1}")
-- pagetitle/storytitle: create short, relevant titles from the overall content.
-- typeofquiz: "Educational" (or "शैक्षिक" in Hindi) if unknown.
-- s1title1: a 2–5 word intro title; s1text1: 1–2 sentence intro.
-- results_*: short friendly strings in the same language. results_bg_image: "" if none.
-
-Return only the JSON object.
-""".strip()
-
-# ---------------------------
-# Helpers
-# ---------------------------
-def clean_model_json(txt: str) -> str:
-    """Remove code fences if model returns ```json ... ``` or ``` ... ```."""
-    fenced = re.findall(r"```(?:json)?\s*(.*?)```", txt, flags=re.DOTALL)
-    if fenced:
-        return fenced[0].strip()
-    return txt.strip()
-
-def _variation_token(n: int = 6) -> str:
-    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=n))
-
-def _variation_style() -> str:
-    return random.choice([
-        "exam-focused neutral tone",
-        "student-friendly tone",
-        "teacher’s concise quiz tone",
-        "competitive test prep tone",
-        "flashcard-style phrasing"
-    ])
-
-def ocr_azure_read(bytes_blob: bytes) -> dict:
-    """
-    Call Azure DI prebuilt-read and return a dict:
-    {
-      "text": "<full text>",
-      "pages": [
-         {"pageNumber": 1, "text": "..."},
-         ...
-      ]
-    }
-    Works for images and PDFs.
-    """
-    poller = di_client.begin_analyze_document(
-        model_id="prebuilt-read",
-        body=bytes_blob
-    )
-    result = poller.result()
-
-    pages_out = []
-    full_lines = []
-
-    # Prefer paragraphs with page grouping if available
-    # Fallback to per-page lines
-    if getattr(result, "pages", None):
-        for p in result.pages:
-            page_lines = []
-            for line in getattr(p, "lines", []) or []:
-                if getattr(line, "content", None):
-                    page_lines.append(line.content)
-            page_text = "\n".join(page_lines).strip()
-            pages_out.append({"pageNumber": getattr(p, "page_number", len(pages_out) + 1), "text": page_text})
-            if page_text:
-                full_lines.append(f"[[PAGE {p.page_number}]]\n{page_text}")
-    elif getattr(result, "paragraphs", None):
-        # single lump with no page info—still return text
-        allp = "\n".join([pp.content for pp in result.paragraphs if getattr(pp, "content", None)]).strip()
-        pages_out.append({"pageNumber": 1, "text": allp})
-        if allp:
-            full_lines.append(f"[[PAGE 1]]\n{allp}")
-    else:
-        # last resort: use result.content if set
-        raw = getattr(result, "content", "") or ""
-        pages_out.append({"pageNumber": 1, "text": raw.strip()})
-        if raw:
-            full_lines.append(f"[[PAGE 1]]\n{raw.strip()}")
-
-    return {
-        "text": "\n\n".join(full_lines).strip(),
-        "pages": pages_out
-    }
-
-def ocr_extract_many_mixed(files) -> str:
-    """
-    Accepts a mixed list of Streamlit UploadedFile (images and PDFs).
-    Returns concatenated text with [[PAGE n]] markers per file/page.
-    """
-    chunks = []
-    for fidx, f in enumerate(files, start=1):
-        b = f.getvalue()
-        out = ocr_azure_read(b)
-        if out["text"]:
-            # add file header so multi-file inputs are traceable
-            chunks.append(f"[[FILE {fidx}: {f.name}]]\n{out['text']}")
-    return "\n\n".join(chunks).strip()
-
-def gpt_ocr_text_to_questions(raw_text: str, diversify: bool = False) -> dict:
-    """
-    Convert OCR text that already contains questions into structured JSON.
-    If diversify=True, add a random token/style + slightly higher temperature.
-    """
-    temp = 0.0 if not diversify else 0.6
-    sys = SYSTEM_PROMPT_OCR_TO_QA
-    if diversify:
-        sys = sys + f"\n\nVARIATION_TOKEN: { _variation_token() }\nStyle hint: { _variation_style() }"
-    resp = gpt_client.chat.completions.create(
-        model=GPT_DEPLOYMENT,
-        temperature=temp,
-        messages=[
-            {"role": "system", "content": sys},
-            {"role": "user", "content": raw_text}
+    payload_fix = {
+        "messages": [
+            {"role": "system",
+             "content": "You are a strict JSON formatter. You output ONLY valid minified JSON. No prose."},
+            {"role": "user",
+             "content": f"This text was intended to be JSON but is invalid/truncated. "
+                        f"Repair it into valid JSON that matches the schema.\n\nSchema:\n{schema_hint}\n\nText:\n{raw_reply}"}
         ],
-    )
-    content = clean_model_json(resp.choices[0].message.content)
+        "temperature": 0.0,
+        "max_tokens": 1400,
+        "response_format": {"type": "json_object"}
+    }
     try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        m = re.search(r"\{.*\}", content, flags=re.DOTALL)
-        if not m:
-            raise
-        return json.loads(m.group(0))
+        res = requests.post(chat_url, headers=headers, json=payload_fix, timeout=150)
+        if res.status_code != 200:
+            return None
+        fixed = res.json()["choices"][0]["message"]["content"]
+        return robust_parse_model_json(fixed)
+    except Exception:
+        return None
 
-def gpt_notes_to_questions(notes_text: str, diversify: bool = False) -> dict:
+
+def call_azure_chat(messages, *, temperature=0.2, max_tokens=1800, force_json=True):
+    """Call Azure Chat (JSON mode default). Returns (ok, content_or_err)."""
+    chat_headers = {"Content-Type": "application/json", "api-key": AZURE_API_KEY}
+    chat_url = f"{AZURE_ENDPOINT.rstrip('/')}/openai/deployments/{AZURE_DEPLOYMENT}/chat/completions"
+    params = {"api-version": AZURE_API_VERSION}
+
+    body = {"messages": messages, "temperature": temperature, "max_tokens": max_tokens}
+    if force_json:
+        body["response_format"] = {"type": "json_object"}
+
+    try:
+        res = requests.post(chat_url, headers=chat_headers, params=params, json=body, timeout=150)
+    except Exception as e:
+        return False, f"Azure request failed: {e}"
+
+    if res.status_code == 200:
+        return True, res.json()["choices"][0]["message"]["content"]
+
+    # If JSON mode fails, retry without it
+    if force_json:
+        body.pop("response_format", None)
+        try:
+            res2 = requests.post(chat_url, headers=chat_headers, params=params, json=body, timeout=150)
+            if res2.status_code == 200:
+                return True, res2.json()["choices"][0]["message"]["content"]
+            return False, f"Azure Chat error: {res2.status_code} — {res2.text[:300]}"
+        except Exception as e:
+            return False, f"Azure retry failed: {e}"
+
+    return False, f"Azure Chat error: {res.status_code} — {res.text[:300]}"
+
+# ---------- Language auto-detect (Hindi vs English) ----------
+def detect_hi_or_en(text: str) -> str:
+    """Return 'hi' if text is mostly Devanagari, else 'en'."""
+    if not text:
+        return "en"
+    devanagari = sum(0x0900 <= ord(c) <= 0x097F for c in text)
+    latin = sum(('A' <= c <= 'Z') or ('a' <= c <= 'z') for c in text)
+    total_letters = devanagari + latin
+    if total_letters == 0:
+        return "hi" if devanagari > 0 else "en"
+    return "hi" if (devanagari / total_letters) >= 0.25 else "en"
+
+# ---------- Azure Document Intelligence (OCR) ----------
+def ocr_extract_bytes(image_bytes: bytes):
     """
-    Generate 5 MCQs from notes. If diversify=True, we inject a random token/style
-    and increase temperature so repeated inputs produce varied outputs.
+    Uses Azure Document Intelligence 'prebuilt-read' to extract text.
+    Returns (ok: bool, text_or_error: str).
     """
-    temp = 0.0 if not diversify else 0.7
-    sys = SYSTEM_PROMPT_NOTES_TO_QA_BASE
-    if diversify:
-        sys = sys + f"\n\nVARIATION_TOKEN: { _variation_token() }\nStyle hint: { _variation_style() }"
-    resp = gpt_client.chat.completions.create(
-        model=GPT_DEPLOYMENT,
-        temperature=temp,
-        messages=[
-            {"role": "system", "content": sys},
-            {"role": "user", "content": notes_text}
+    if DocumentIntelligenceClient is None or AzureKeyCredential is None:
+        return False, ("azure-ai-documentintelligence is not installed. "
+                       "Add it to requirements.txt and set AZURE_DI_ENDPOINT / AZURE_DI_KEY.")
+
+    if not (AZURE_DI_ENDPOINT and AZURE_DI_KEY):
+        return False, "Missing AZURE_DI_ENDPOINT / AZURE_DI_KEY."
+
+    try:
+        client = DocumentIntelligenceClient(
+            endpoint=AZURE_DI_ENDPOINT.rstrip("/"),
+            credential=AzureKeyCredential(AZURE_DI_KEY),
+        )
+        poller = client.begin_analyze_document("prebuilt-read", body=image_bytes)
+        doc = poller.result()
+        paragraphs = getattr(doc, "paragraphs", None) or []
+        if paragraphs:
+            text = "\n".join(p.content for p in paragraphs if getattr(p, "content", None))
+            text = (text or "").strip()
+            if text:
+                return True, text
+        # fallback to raw content if available
+        content = getattr(doc, "content", "") or ""
+        if content.strip():
+            return True, content.strip()
+        return False, "Document Intelligence returned no text."
+    except Exception as e:
+        return False, f"Doc Intelligence error: {e}"
+
+# -------- NEW: Enrich alt prompts for better image generation --------
+def enrich_alt_prompts_with_model(result_json: dict, language: str) -> dict:
+    """
+    Turn s1..s6 'alt1' prompts into rich, safe, image-gen prompts using Azure Chat.
+    Returns a *new* dict with the same keys but improved alt prompts.
+    """
+    # If Azure config is missing, just return input unchanged
+    if not (AZURE_API_KEY and AZURE_ENDPOINT and AZURE_DEPLOYMENT and AZURE_API_VERSION):
+        return dict(result_json)
+
+    headers = {"Content-Type": "application/json", "api-key": AZURE_API_KEY}
+    chat_url = f"{AZURE_ENDPOINT.rstrip('/')}/openai/deployments/{AZURE_DEPLOYMENT}/chat/completions?api-version={AZURE_API_VERSION}"
+
+    sys_msg = (
+        "You are an art director who writes SINGLE, detailed prompts for image generation.\n"
+        "Return ONLY valid JSON with one key 'alt'.\n"
+        "The prompt must:\n"
+        "- Be in the requested language when relevant.\n"
+        "- Be a single paragraph (no lists), <= 1200 characters.\n"
+        "- Specify: subject(s), setting, composition (foreground/mid/background), camera/perspective, "
+        "lighting, color palette, mood/emotion, motion/action where relevant, style keywords.\n"
+        "- Enforce style: flat vector illustration, clean shapes, smooth gradients, crisp edges, "
+        "no text/captions/logos, no watermarks, no trademarks, no real-person likeness.\n"
+        "- Keep it family-friendly, safe, inclusive; replace unsafe content with abstract, peaceful motifs.\n"
+        "Output JSON ONLY: {\"alt\":\"...\"}"
+    )
+
+    improved = dict(result_json)
+    for i in range(1, 7):
+        base_alt = (result_json.get(f"s{i}alt1") or "").strip()
+        slide_txt = (result_json.get(f"s{i}paragraph1") or "").strip()
+        # If both are empty, skip
+        if not (base_alt or slide_txt):
+            continue
+
+        user_msg = (
+            f"Language: {language}\n"
+            f"Slide text (context): {slide_txt}\n"
+            f"Existing short prompt: {base_alt}\n\n"
+            "Write a SINGLE improved prompt in the JSON format described."
+        )
+        payload = {
+            "messages": [
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": user_msg}
+            ],
+            "temperature": 0.3,
+            "max_tokens": 700,
+            "response_format": {"type": "json_object"}
+        }
+
+        try:
+            r = requests.post(chat_url, headers=headers, json=payload, timeout=90)
+            if r.status_code == 200:
+                content = r.json()["choices"][0]["message"]["content"]
+                data = robust_parse_model_json(content)
+                if isinstance(data, dict) and data.get("alt"):
+                    improved[f"s{i}alt1"] = data["alt"]
+                    continue  # next slide
+        except Exception:
+            pass  # fall through to keep original
+
+        # Fallback: if enrichment fails, ensure at least safe guardrails on original
+        improved[f"s{i}alt1"] = (
+            (base_alt or slide_txt) +
+            " — flat vector illustration, clean geometric shapes, smooth gradients, harmonious palette, "
+            "inclusive and family-friendly; no text, no logos, no watermarks, no real-person likeness."
+        )
+
+    return improved
+
+# -------- Image generation + S3 upload --------
+def sanitize_prompt(chat_url: str, headers: dict, original_prompt: str) -> str:
+    """Rewrite any risky prompt into a safe, positive, family-friendly version using Azure Chat."""
+    sanitize_payload = {
+        "messages": [
+            {"role": "system", "content": (
+                "Rewrite image prompts to be safe, positive, inclusive, and family-friendly. "
+                "Remove any hate/harassment/violence/adult/illegal/extremist content, slogans, logos, "
+                "or real-person likenesses. Keep the core educational idea and flat vector art style. "
+                "Return ONLY the rewritten prompt text."
+            )},
+            {"role": "user", "content": f"Original prompt:\n{original_prompt}\n\nRewritten safe prompt:"}
         ],
+        "temperature": 0.2,
+        "max_tokens": 300
+    }
+    try:
+        sr = requests.post(chat_url, headers=headers, json=sanitize_payload, timeout=60)
+        if sr.status_code == 200:
+            return sr.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        st.info(f"Sanitizer call failed; using local guards: {e}")
+
+    # Toughened local fallback
+    return (
+        original_prompt +
+        " — flat vector illustration, clean geometric shapes, smooth gradients, harmonious palette, "
+        "inclusive and family-friendly; no text, no logos, no watermarks, no real-person likeness."
     )
-    content = clean_model_json(resp.choices[0].message.content)
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        m = re.search(r"\{.*\}", content, flags=re.DOTALL)
-        if not m:
-            raise
-        return json.loads(m.group(0))
 
-def gpt_questions_to_placeholders(questions_data: dict) -> dict:
-    """Map structured questions JSON into flat placeholder JSON for AMP template."""
-    q = questions_data.get("questions", [])
-    if len(q) > 5:
-        questions_data = {"questions": q[:5]}
 
-    # Prefer the modern call; keep backward-compatible fallback
-    if hasattr(gpt_client, "chat_completions"):
-        resp = gpt_client.chat_completions.create(
-            model=GPT_DEPLOYMENT,
-            temperature=0,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT_QA_TO_PLACEHOLDERS},
-                {"role": "user", "content": json.dumps(questions_data, ensure_ascii=False)}
-            ],
-        )
-        choice_msg = getattr(resp.choices[0], "message", None)
-        content = clean_model_json(choice_msg.content if choice_msg else "")
-    else:
-        resp = gpt_client.chat.completions.create(
-            model=GPT_DEPLOYMENT,
-            temperature=0,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT_QA_TO_PLACEHOLDERS},
-                {"role": "user", "content": json.dumps(questions_data, ensure_ascii=False)}
-            ],
-        )
-        content = clean_model_json(resp.choices[0].message.content)
-
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        m = re.search(r"\{.*\}", content, flags=re.DOTALL)
-        if not m:
-            raise
-        return json.loads(m.group(0))
-
-def build_attr_value(key: str, val: str) -> str:
-    """s2option3attr = 'correct' → 'option-3-correct'; else passthrough/empty."""
-    if not key.endswith("attr") or not val:
-        return ""
-    m = re.match(r"s(\d+)option(\d)attr$", key)
-    if m and val.strip().lower() == "correct":
-        return f"option-{m.group(2)}-correct"
-    return val
-
-def fill_template(template: str, data: dict) -> str:
-    """Replace {{key}} and {{key|safe}} using placeholder data, handling *attr keys specially."""
-    rendered = {}
-    for k, v in data.items():
-        if k.endswith("attr"):
-            rendered[k] = build_attr_value(k, str(v))
-        else:
-            rendered[k] = "" if v is None else str(v)
-    html = template
-    for k, v in rendered.items():
-        html = html.replace(f"{{{{{k}}}}}", v)
-        html = html.replace(f"{{{{{k}|safe}}}}", v)
-    return html
-
-def upload_html_to_s3(html_text: str, filename: str):
-    """
-    Upload HTML to S3 and return (s3_key, cdn_url).
-    No ACL is set (works with CloudFront + Origin Access).
-    """
-    if not filename.lower().endswith(".html"):
-        filename = f"{filename}.html"
-
-    s3_key = f"{HTML_S3_PREFIX.strip('/')}/{filename}" if HTML_S3_PREFIX else filename
+def generate_and_upload_images(result_json: dict) -> dict:
+    """Generate DALL·E images, upload originals to S3, return CDN resized URLs in JSON."""
+    if not all([DALE_ENDPOINT, DAALE_KEY, AWS_ACCESS_KEY, AWS_SECRET_KEY, AWS_BUCKET]):
+        st.error("Missing DALL·E and/or AWS S3 secrets.")
+        return {**result_json}
 
     s3 = get_s3_client()
-    s3.put_object(
-        Bucket=AWS_BUCKET,
-        Key=s3_key,
-        Body=html_text.encode("utf-8"),
-        ContentType="text/html; charset=utf-8",
-        CacheControl="public, max-age=300",
-        ContentDisposition=f'inline; filename="{filename}"',
+
+    slug = (
+        (result_json.get("storytitle") or "story")
+        .lower()
+        .replace(" ", "-")
+        .replace(":", "")
+        .replace(".", "")
     )
+    out = {k: result_json[k] for k in result_json}
+    first_slide_key = None
 
-    cdn_url = f"{CDN_HTML_BASE.rstrip('/')}/{s3_key}"
-    return s3_key, cdn_url
+    headers_dalle = {"Content-Type": "application/json", "api-key": DAALE_KEY}
+    progress = st.progress(0, text="Generating images…")
 
-# ---------------------------
-# 🧩 Builder UI
-# ---------------------------
-tab_all, = st.tabs(["All-in-one Builder"])
+    for i in range(1, 7):
+        raw_prompt = result_json.get(f"s{i}alt1", "") or ""
+        chat_headers = {"Content-Type": "application/json", "api-key": AZURE_API_KEY}
+        chat_url = f"{AZURE_ENDPOINT.rstrip('/')}/openai/deployments/{AZURE_DEPLOYMENT}/chat/completions?api-version={AZURE_API_VERSION}"
+        safe_prompt = sanitize_prompt(chat_url, chat_headers, raw_prompt)
 
-with tab_all:
-    st.subheader("Build final AMP HTML from image(s)/PDF(s) or structured JSON")
-    st.caption("Pick an input source, upload AMP HTML template, and download the final HTML with a timestamped filename.")
+        payload = {"prompt": safe_prompt, "n": 1, "size": "1024x1024"}
+        image_url = None
 
-    mode = st.radio(
-        "Choose input",
-        [
-            "Notes image(s)/PDF(s) (OCR → generate quiz JSON)",
-            "Quiz image(s)/PDF(s) (OCR → parse existing MCQs)",
-            "Structured JSON (skip OCR)"
+        for attempt in range(3):
+            r = requests.post(DALE_ENDPOINT, headers=headers_dalle, json=payload, timeout=120)
+            if r.status_code == 200:
+                try:
+                    image_url = r.json()["data"][0]["url"]
+                    break
+                except Exception as e:
+                    st.info(f"Slide {i}: unexpected DALL·E response format: {e}")
+                    break
+            elif r.status_code in (400, 403):
+                st.info(f"Slide {i}: DALL·E blocked, retrying with fallback.")
+                payload = {"prompt": SAFE_FALLBACK, "n": 1, "size": "1024x1024"}
+                continue
+            elif r.status_code == 429:
+                st.info(f"Slide {i}: rate-limited, waiting 10s…")
+                time.sleep(10)
+            else:
+                st.info(f"Slide {i}: DALL·E error {r.status_code} — {r.text[:200]}")
+                break
+
+        if image_url:
+            try:
+                img_data = requests.get(image_url, timeout=120).content
+                buffer = BytesIO(img_data)  # upload original; no local resize
+                key = f"{S3_PREFIX.rstrip('/')}/{slug}/slide{i}.jpg"
+                extra_args = {"ContentType": "image/jpeg"}
+                # No ACL
+                s3.upload_fileobj(buffer, AWS_BUCKET, key, ExtraArgs=extra_args)
+                if i == 1:
+                    first_slide_key = key
+
+                # build CDN resized URL (720x1200)
+                final_url = build_resized_cdn_url(AWS_BUCKET, key, 720, 1200)
+                out[f"s{i}image1"] = final_url
+            except Exception as e:
+                st.info(f"Slide {i}: upload/CDN URL build failed → {e}")
+                out[f"s{i}image1"] = DEFAULT_ERROR_IMAGE
+        else:
+            out[f"s{i}image1"] = DEFAULT_ERROR_IMAGE
+
+        progress.progress(i/6.0, text=f"Generating images… ({i}/6)")
+
+    progress.empty()
+
+    # portrait cover from slide 1 via CDN (640x853) — keep both spellings for template compatibility
+    try:
+        if first_slide_key:
+            cover = build_resized_cdn_url(AWS_BUCKET, first_slide_key, 640, 853)
+            out["portraitcoverurl"] = cover
+            out["potraitcoverurl"] = cover  # backward-compat
+            out["potraightcoverurl"] = cover
+        else:
+            out["portraitcoverurl"] = DEFAULT_ERROR_IMAGE
+            out["potraitcoverurl"] = DEFAULT_ERROR_IMAGE
+            out["potraightcoverurl"] = DEFAULT_ERROR_IMAGE
+    except Exception as e:
+        st.info(f"Portrait cover URL build failed: {e}")
+        out["portraitcoverurl"] = DEFAULT_ERROR_IMAGE
+        out["potraitcoverurl"] = DEFAULT_ERROR_IMAGE
+        out["potraightcoverurl"] = DEFAULT_ERROR_IMAGE
+
+    return out
+
+
+def generate_seo_metadata(chat_url: str, headers: dict, result_json: dict, lang_code: str):
+    """Ask the model for SEO metadata in the detected language."""
+    lang_code = (lang_code or "").strip() or "auto"
+    seo_prompt = f"""
+Generate SEO metadata for a web story. Write ALL outputs in this language: {lang_code}
+
+Title: {result_json.get("storytitle","")}
+Slides:
+- {result_json.get("s1paragraph1","")}
+- {result_json.get("s2paragraph1","")}
+- {result_json.get("s3paragraph1","")}
+- {result_json.get("s4paragraph1","")}
+- {result_json.get("s5paragraph1","")}
+- {result_json.get("s6paragraph1","")}
+
+Respond strictly in this JSON format:
+{{
+  "metadescription": "...",
+  "metakeywords": "keyword1, keyword2, ..."
+}}
+"""
+    payload_seo = {
+        "messages": [
+            {"role": "system", "content": "You are an expert SEO assistant. Answer ONLY with valid JSON."},
+            {"role": "user", "content": seo_prompt}
         ],
-        horizontal=False
-    )
+        "temperature": 0.5,
+        "max_tokens": 400,
+        "response_format": {"type": "json_object"}
+    }
+    try:
+        r = requests.post(chat_url, headers=headers, json=payload_seo, timeout=90)
+        if r.status_code != 200:
+            return "Explore this insightful story.", "web story, inspiration"
+        content = r.json()["choices"][0]["message"]["content"]
+        data = robust_parse_model_json(content) or {}
+        return data.get("metadescription", "Explore this insightful story."), \
+               data.get("metakeywords", "web story, inspiration")
+    except Exception:
+        return "Explore this insightful story.", "web story, inspiration"
 
-    up_tpl = st.file_uploader("📎 Upload AMP HTML template (.html)", type=["html", "htm"], key="tpl")
-    show_debug = st.toggle("Show OCR / JSON previews", value=False)
-    diversify = st.toggle("Always vary output (even for identical inputs)", value=True,
-                          help="Adds a random style token and higher temperature so repeated inputs yield different phrasing/questions.")
 
-    questions_data = None
+def pick_voice_for_language(lang_code: str, default_voice: str) -> str:
+    """Map detected language → Azure voice name."""
+    if not lang_code:
+        return default_voice
+    l = lang_code.lower()
+    if l.startswith("hi"):
+        return "hi-IN-AaravNeural"
+    if l.startswith("en-in"):
+        return "en-IN-NeerjaNeural"
+    if l.startswith("en"):
+        return "en-IN-AaravNeural"
+    if l.startswith("bn"):
+        return "bn-IN-BashkarNeural"
+    if l.startswith("ta"):
+        return "ta-IN-PallaviNeural"
+    if l.startswith("te"):
+        return "te-IN-ShrutiNeural"
+    if l.startswith("mr"):
+        return "mr-IN-AarohiNeural"
+    if l.startswith("gu"):
+        return "gu-IN-DhwaniNeural"
+    if l.startswith("kn"):
+        return "kn-IN-SapnaNeural"
+    if l.startswith("pa"):
+        return "pa-IN-GeetikaNeural"
+    return default_voice
 
-    if mode == "Notes image(s)/PDF(s) (OCR → generate quiz JSON)":
-        up_files = st.file_uploader(
-            "📎 Upload notes files — images (JPG/PNG/WebP/TIFF) and/or PDFs (multiple allowed)",
-            type=["jpg", "jpeg", "png", "webp", "tiff", "pdf"],
-            accept_multiple_files=True,
-            key="notes_files"
-        )
-        if up_files:
-            try:
-                if show_debug:
-                    for i, f in enumerate(up_files, start=1):
-                        if f.type.startswith("image/"):
-                            try:
-                                st.image(Image.open(io.BytesIO(f.getvalue())).convert("RGB"),
-                                         caption=f"Notes file {i}: {f.name}", use_container_width=True)
-                            except Exception:
-                                pass
-                        else:
-                            st.write(f"📄 Notes file {i}: {f.name} (PDF)")
 
-                with st.spinner("🔍 OCR (Azure Document Intelligence) on all inputs…"):
-                    notes_text = ocr_extract_many_mixed(up_files)
+def fill_template_strict(template: str, data: dict):
+    """Replace {{key}} with string(value). Also return placeholders detected (for missing-report)."""
+    placeholders = set(re.findall(r"\{\{\s*([a-zA-Z0-9_\-]+)\s*\}\}", template))
+    for k, v in data.items():
+        template = template.replace(f"{{{{{k}}}}}", str(v))
+    return template, placeholders
 
-                if not notes_text.strip():
-                    st.error("OCR returned empty text. Try clearer scans or different files.")
-                    st.stop()
+# ---- helpers for root uploads/URLs (hard-locked) ----
+def _s3_key(name: str) -> str:
+    """Always just filename (bucket root)."""
+    return name  # HTML S3 uploads at root
 
-                if show_debug:
-                    with st.expander("📄 OCR Notes Text"):
-                        st.text(notes_text[:8000] if len(notes_text) > 8000 else notes_text)
 
-                with st.spinner("📝 Generating 5 MCQs from notes…"):
-                    questions_data = gpt_notes_to_questions(notes_text, diversify=diversify)
+def _cdn_url(name: str) -> str:
+    """CDN base + filename at root."""
+    return f"{CDN_HTML_BASE.rstrip('/')}/{name}"
 
-                if show_debug:
-                    with st.expander("🧱 Generated Questions JSON"):
-                        st.code(json.dumps(questions_data, ensure_ascii=False, indent=2)[:12000], language="json")
+# ---------------------------
+# UI
+# ---------------------------
+img = st.file_uploader("Upload a notes image (JPG/PNG)", type=["jpg", "jpeg", "png"])
+html_files = st.file_uploader("Upload one or more HTML templates (with {{placeholders}})", type=["html", "htm"], accept_multiple_files=True)
 
-            except Exception as e:
-                st.error(f"Failed to process notes → quiz JSON: {e}")
-                st.stop()
+c1, c2, c3 = st.columns(3)
+with c1:
+    include_seo = st.checkbox("Generate SEO metadata", value=True)
+with c2:
+    include_tts = st.checkbox("Generate TTS audio", value=True)
+with c3:
+    add_time_fields = st.checkbox("Add time fields", value=True, help="Adds {{publishedtime}} and {{modifiedtime}} (UTC ISO).")
 
-    elif mode == "Quiz image(s)/PDF(s) (OCR → parse existing MCQs)":
-        up_files = st.file_uploader(
-            "📎 Upload quiz files — images (JPG/PNG) and/or PDFs (multiple allowed)",
-            type=["jpg", "jpeg", "png", "pdf"],
-            accept_multiple_files=True,
-            key="quiz_files"
-        )
-        if up_files:
-            try:
-                if show_debug:
-                    for i, f in enumerate(up_files, start=1):
-                        if f.type.startswith("image/"):
-                            try:
-                                st.image(Image.open(io.BytesIO(f.getvalue())).convert("RGB"),
-                                         caption=f"Quiz file {i}: {f.name}", use_container_width=True)
-                            except Exception:
-                                pass
-                        else:
-                            st.write(f"📄 Quiz file {i}: {f.name} (PDF)")
+run = st.button("🚀 Run")
 
-                with st.spinner("🔍 OCR (Azure Document Intelligence)…"):
-                    raw_text = ocr_extract_many_mixed(up_files)
+if run:
+    # Basic validation
+    if not img:
+        st.error("Please upload a notes image.")
+        st.stop()
+    if not html_files:
+        st.error("Please upload at least one HTML template.")
+        st.stop()
 
-                if not raw_text.strip():
-                    st.error("OCR returned empty text. Try clearer scans or different files.")
-                    st.stop()
+    # Preview image
+    try:
+        raw_bytes = img.getvalue()
+        if not raw_bytes:
+            st.error("Uploaded image is empty.")
+            st.stop()
+        pil_img = Image.open(BytesIO(raw_bytes)).convert("RGB")
+        st.image(pil_img, caption="Uploaded image", use_container_width=True)
+    except Exception as e:
+        st.error(f"Could not open image: {e}")
+        st.stop()
 
-                if show_debug:
-                    with st.expander("📄 OCR Text"):
-                        st.text(raw_text[:8000] if len(raw_text) > 8000 else raw_text)
+    # -------- OCR with Azure Document Intelligence --------
+    with st.spinner("Reading text with Azure Document Intelligence (prebuilt-read)…"):
+        ok_ocr, raw_text = ocr_extract_bytes(raw_bytes)
+        if not ok_ocr:
+            st.error(raw_text)
+            st.stop()
 
-                with st.spinner("🤖 Parsing OCR into questions JSON…"):
-                    questions_data = gpt_ocr_text_to_questions(raw_text, diversify=diversify)
+    with st.expander("🔎 OCR extracted text"):
+        st.write(raw_text[:20000] if raw_text else "(empty)")
 
-                if show_debug:
-                    with st.expander("🧱 Structured Questions JSON"):
-                        st.code(json.dumps(questions_data, ensure_ascii=False, indent=2)[:12000], language="json")
+    # -------- Language auto-detect (hi/en) --------
+    target_lang = detect_hi_or_en(raw_text)
+    st.info(f"Target language (auto): **{target_lang}**")
 
-            except Exception as e:
-                st.error(f"Failed to process quiz files → JSON: {e}")
-                st.stop()
+    # -------- Summarize with GPT into JSON (s1..s6 + s1alt..s6alt) --------
+    system_prompt = f"""
+You are a multilingual teaching assistant.
 
-    else:  # Structured JSON
-        up_json = st.file_uploader("📎 Upload structured questions JSON", type=["json"], key="json")
-        if up_json:
-            try:
-                questions_data = json.loads(up_json.getvalue().decode("utf-8"))
-                if show_debug:
-                    with st.expander("🧱 Structured Questions JSON"):
-                        st.code(json.dumps(questions_data, ensure_ascii=False, indent=2)[:12000], language="json")
-            except Exception as e:
-                st.error(f"Invalid JSON: {e}")
-                st.stop()
+INPUT:
+- You will receive raw OCR text from a notes image.
 
-    build = st.button("🛠️ Build final HTML", disabled=not (questions_data and up_tpl))
+MANDATORY:
+- Target language = "{target_lang}" (use concise BCP-47 like "en" or "hi").
+- Produce ALL text fields strictly in the Target language.
 
-    if build and questions_data and up_tpl:
+Your job:
+1) Extract a short and catchy title → storytitle (Target language)
+2) Summarise the content into 6 slides (s1paragraph1..s6paragraph1), each ≤ 400 characters (Target language).
+3) For each paragraph (including slide 1), write a DALL·E prompt (s1alt1..s6alt1) for a 1024x1024 flat vector illustration: bright colors, clean lines, no text/captions/logos. (Prompts must not request text in the image.)
+
+SAFETY & POSITIVITY RULES (MANDATORY):
+- If the source includes hate, harassment, violence, adult content, self-harm, illegal acts, or extremist symbols, DO NOT reproduce them.
+- Reinterpret into a positive, inclusive, family-friendly, educational scene (unity, learning, empathy, community, peace).
+- Replace any hateful/violent symbol with abstract shapes, nature, or neutral motifs.
+- Never include real people’s likeness or sensitive groups in a negative way.
+- Avoid slogans, gestures, flags, trademarks, or captions. Absolutely NO TEXT in the image.
+
+Respond strictly in this JSON format (keys in English; values in Target language):
+{{
+  "language": "{target_lang}",
+  "storytitle": "...",
+  "s1paragraph1": "...",
+  "s2paragraph1": "...",
+  "s3paragraph1": "...",
+  "s4paragraph1": "...",
+  "s5paragraph1": "...",
+  "s6paragraph1": "...",
+  "s1alt1": "...",
+  "s2alt1": "...",
+  "s3alt1": "...",
+  "s4alt1": "...",
+  "s5alt1": "...",
+  "s6alt1": "..."
+}}
+"""
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"OCR TEXT:\n{raw_text}\n\nReturn only the JSON object described above."}
+    ]
+
+    with st.spinner("Summarizing OCR text with Azure OpenAI…"):
+        ok, content = call_azure_chat(messages, temperature=0.0, max_tokens=1800, force_json=True)
+        if not ok:
+            st.error(content)
+            st.stop()
+
+        result = robust_parse_model_json(content)
+        if not isinstance(result, dict):
+            # One-shot repair
+            chat_headers = {"Content-Type": "application/json", "api-key": AZURE_API_KEY}
+            chat_url = f"{AZURE_ENDPOINT.rstrip('/')}/openai/deployments/{AZURE_DEPLOYMENT}/chat/completions?api-version={AZURE_API_VERSION}"
+            fixed = repair_json_with_model(content, chat_url, chat_headers)
+            if isinstance(fixed, dict):
+                result = fixed
+
+        if not isinstance(result, dict):
+            st.error("Model did not return a valid JSON object.\n\nRaw reply (truncated):\n" + content[:800])
+            st.stop()
+
+    # Enforce target language in parsed result
+    result["language"] = target_lang
+    detected_lang = target_lang
+    st.info(f"Detected/target language: **{detected_lang}**")
+
+    # Keep OCR text too (handy for debugging or templates)
+    result["ocr_text"] = raw_text
+
+    st.success("Structured JSON created from OCR.")
+    st.json(result, expanded=False)
+
+    # -------- NEW: Enrich alt prompts (art-director pass) --------
+    with st.spinner("Enhancing image prompts (art-director pass)…"):
+        result = enrich_alt_prompts_with_model(result, detected_lang)
+        st.caption("Alt prompts enriched for subject, setting, composition, lighting, palette, style, perspective, mood.")
+        if st.checkbox("Show enriched alt prompts", value=False):
+            st.json({k: result[k] for k in result if re.match(r"s[1-6]alt1$", k)}, expanded=False)
+
+    # -------- DALL·E images → S3 → CDN --------
+    with st.spinner("Generating DALL·E images and uploading to S3…"):
+        final_json = generate_and_upload_images(result)
+
+    # -------- SEO metadata (optional) --------
+    chat_headers = {"Content-Type": "application/json", "api-key": AZURE_API_KEY}
+    chat_url = f"{AZURE_ENDPOINT.rstrip('/')}/openai/deployments/{AZURE_DEPLOYMENT}/chat/completions?api-version={AZURE_API_VERSION}"
+    if include_seo:
+        with st.spinner("Generating SEO metadata…"):
+            meta_desc, meta_keywords = generate_seo_metadata(chat_url, chat_headers, final_json, detected_lang)
+            final_json["metadescription"] = meta_desc
+            final_json["metakeywords"] = meta_keywords
+
+    # -------- Optional: TTS --------
+    if include_tts:
         try:
-            # → placeholders
-            with st.spinner("🧩 Generating placeholders…"):
-                placeholders = gpt_questions_to_placeholders(questions_data)
-                if show_debug:
-                    with st.expander("🧩 Placeholder JSON"):
-                        st.code(json.dumps(placeholders, ensure_ascii=False, indent=2)[:12000], language="json")
+            import azure.cognitiveservices.speech as speechsdk
+        except Exception as e:
+            st.error("`azure-cognitiveservices-speech` is not installed. Add it to requirements.txt.\n"
+                     f"Import error: {e}")
+            st.stop()
 
-            # read template
-            template_html = up_tpl.getvalue().decode("utf-8")
+        s3 = get_s3_client()
 
-            # merge
-            final_html = fill_template(template_html, placeholders)
+        chosen_voice = pick_voice_for_language(detected_lang, VOICE_NAME_DEFAULT)
+        speech_config = speechsdk.SpeechConfig(subscription=AZURE_SPEECH_KEY, region=AZURE_SPEECH_REGION)
+        speech_config.speech_synthesis_voice_name = chosen_voice
+        st.info(f"TTS voice: **{chosen_voice}**")
 
-            # save timestamped file locally
-            ts_name = f"final_quiz_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
-            Path(ts_name).write_text(final_html, encoding="utf-8")
+        # Map paragraphs to audio fields (s1..s6 paragraphs + title as s1audio1)
+        field_mapping = {
+            "storytitle":    "s1audio1",
+            "s2paragraph1":  "s2audio1",
+            "s3paragraph1":  "s3audio1",
+            "s4paragraph1":  "s4audio1",
+            "s5paragraph1":  "s5audio1",
+            "s6paragraph1":  "s6audio1",
+        }
 
-            # upload to S3 (NO ACL)
-            with st.spinner("☁️ Uploading to S3…"):
-                s3_key, cdn_url = upload_html_to_s3(final_html, ts_name)
+        created_audio = {}
+        with st.spinner("Synthesizing audio and uploading to S3…"):
+            for field, audio_key in field_mapping.items():
+                text = final_json.get(field)
+                if not text:
+                    st.info(f"⚠️ Skipped (missing): {field}")
+                    continue
 
-            st.success(f"✅ Final HTML generated and uploaded to S3: s3://{AWS_BUCKET}/{s3_key}")
-            st.markdown(f"**CDN URL:** {cdn_url}")
+                uuid_name = f"{os.urandom(16).hex()}.mp3"
+                try:
+                    audio_config = speechsdk.audio.AudioOutputConfig(filename=uuid_name)
+                    synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
+                    result_tts = synthesizer.speak_text_async(text).get()
+                    from azure.cognitiveservices.speech import ResultReason
+                    if result_tts.reason == ResultReason.SynthesizingAudioCompleted:
+                        s3_key = f"{S3_PREFIX.rstrip('/')}/audio/{uuid_name}"
+                        extra_args = {"ContentType": "audio/mpeg"}
+                        # No ACL
+                        get_s3_client().upload_file(uuid_name, AWS_BUCKET, s3_key, ExtraArgs=extra_args)
+                        cdn_url = f"{CDN_BASE.rstrip('/')}/{s3_key}"
+                        final_json[audio_key] = cdn_url
+                        created_audio[field] = cdn_url
+                        st.write(f"🎧 {field} → {cdn_url}")
+                    else:
+                        st.error(f"TTS failed for: {field}")
+                except Exception as e:
+                    st.error(f"TTS/Upload error for {field}: {e}")
+                finally:
+                    try:
+                        os.remove(uuid_name)
+                    except Exception:
+                        pass
 
-            with st.expander("🔍 HTML Preview (source)"):
-                st.code(final_html[:120000], language="html")
+            if created_audio:
+                st.json({"audio_created": created_audio}, expanded=False)
 
+    # -------- Add time fields (optional) --------
+    extra_fields = {}
+    if add_time_fields:
+        iso_now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        extra_fields["publishedtime"] = iso_now
+        extra_fields["modifiedtime"] = iso_now
+
+    merged = dict(final_json)
+    merged.update(extra_fields)
+
+    # -------- Fill templates and offer downloads + S3 upload --------
+    def slugify_filename(text: str) -> str:
+        s = (text or "webstory").strip().lower()
+        s = re.sub(r"[:/\\]+", "-", s)
+        s = re.sub(r"\s+", "_", s)
+        s = re.sub(r"[^a-z0-9_\-\.]", "", s)
+        return s or "webstory"
+
+    base_name = slugify_filename(merged.get("storytitle", "webstory"))
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    filled_items = []  # (filename, filled_html)
+
+    if html_files:
+        with st.spinner("Filling HTML templates…"):
+            per_file_reports = []
+
+            for f in html_files:
+                try:
+                    raw_bytes = f.read()
+                    html_text = raw_bytes.decode("utf-8")
+                except Exception:
+                    st.error(f"Could not read {f.name} as UTF-8.")
+                    continue
+
+                filled, placeholders = fill_template_strict(html_text, merged)
+                missing = sorted([p for p in placeholders if f"{{{{{p}}}}}" in html_text and p not in merged])
+                if missing:
+                    per_file_reports.append((f.name, missing))
+
+                # ✅ make output filenames unique per template (prevents overwrite)
+                if len(html_files) == 1:
+                    out_filename = f"{base_name}_{ts}.html"
+                else:
+                    # keep same base, but add index so files don't overwrite each other
+                    idx = len(filled_items) + 1
+                    out_filename = f"{base_name}_{ts}_{idx}.html"
+                filled_items.append((out_filename, filled))
+
+        if per_file_reports:
+            st.warning("Some templates contain placeholders not found in JSON:")
+            for name, missing in per_file_reports:
+                st.write(f"• **{name}** → missing: {', '.join(missing)}")
+
+        st.success("✅ Templates filled.")
+
+        # Local download buttons (optional)
+        json_name = f"{base_name}_{ts}.json"
+        buf = io.StringIO()
+        json.dump(merged, buf, ensure_ascii=False, indent=2)
+        json_str = buf.getvalue()
+        st.download_button(
+            "⬇️ Download Final JSON",
+            data=json_str.encode("utf-8"),
+            file_name=json_name,
+            mime="application/json"
+        )
+
+        if len(filled_items) == 1:
+            single_name, single_html = filled_items[0]
             st.download_button(
-                "⬇️ Download final HTML",
-                data=final_html.encode("utf-8"),
-                file_name=ts_name,
+                "⬇️ Download Filled HTML",
+                data=single_html.encode("utf-8"),
+                file_name=single_name,
                 mime="text/html"
             )
-
-            # 👀 Live HTML Viewer (inline)
-            st.markdown("### 👀 Live HTML Preview")
-            h = st.slider("Preview height (px)", min_value=400, max_value=1600, value=900, step=50)
-            full_width = st.checkbox("Force full viewport width (100vw)", value=True,
-                                     help="Overrides container width so the preview stretches edge-to-edge.")
-            style = f"width: {'100vw' if full_width else '100%'}; height: {h}px; border: 0; margin: 0; padding: 0;"
-            st_html(final_html, height=h, scrolling=True) if not full_width else st_html(
-                f'<div style="position:relative;left:50%;right:50%;margin-left:-50vw;margin-right:-50vw;{style}">{final_html}</div>',
-                height=h,
-                scrolling=True
+        else:
+            zip_buf = BytesIO()
+            with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
+                for name, html in filled_items:
+                    z.writestr(name, html)
+            zip_buf.seek(0)
+            st.download_button(
+                "⬇️ Download All Filled HTML (ZIP)",
+                data=zip_buf.getvalue(),
+                file_name=f"{base_name}__filled_{ts}.zip",
+                mime="application/zip"
             )
 
-            st.info("AMP pages may not fully render inside Streamlit due to CSP/sandbox. For a faithful view, download and open in a real browser or deploy to a server.")
-        except Exception as e:
-            st.error(f"Build failed: {e}")
-    elif not (questions_data and up_tpl):
-        st.info("Upload an input (notes/quiz files or JSON) **and** a template to enable the Build button.")
+        # ---------- Upload JSON + HTML to S3 (bucket root) and VERIFY ----------
+        st.subheader("🌐 Upload to S3 + Verification")
+        uploaded_urls = []
+        verifications = []
+
+        # 1) Upload JSON (root)
+        json_filename = f"{base_name}_{ts}.json"
+        json_key = _s3_key(json_filename)  # root
+        res_json = s3_put_text_file(
+            bucket=AWS_BUCKET,
+            key=json_key,
+            body=json_str.encode("utf-8"),
+            content_type="application/json"
+        )
+        if res_json["ok"]:
+            json_cdn_url = _cdn_url(json_filename)
+            uploaded_urls.append(("JSON", json_cdn_url))
+        verifications.append({"file": json_filename, **res_json})
+
+        # 2) Upload each HTML file (root) and verify
+        for name, html in filled_items:
+            html_key = _s3_key(name)
+            res_html = s3_put_text_file(
+                bucket=AWS_BUCKET,
+                key=html_key,
+                body=html.encode("utf-8"),
+                content_type="text/html; charset=utf-8"
+            )
+            if res_html["ok"]:
+                html_cdn_url = _cdn_url(name)  # https://cdn.suvichaar.org/<file>.html
+                uploaded_urls.append(("HTML", html_cdn_url))
+            verifications.append({"file": name, **res_html})
+
+        # Show results
+        if uploaded_urls:
+            for kind, url in uploaded_urls:
+                st.markdown(f"- **{kind}**: {url}")
+        st.json({"s3_verification": verifications}, expanded=False)
+
+        if uploaded_urls and all(v.get("ok") for v in verifications):
+            st.success("✅ Files uploaded to S3 and verified via HEAD. CDN should serve them at the URLs above (allow a short cache/propagation delay).")
+        else:
+            st.error("Some uploads failed or could not be verified. Check the errors above — common issues: wrong bucket name, IAM permissions (s3:PutObject and s3:HeadObject), or Public Access Block.")
+
+        # ---------------------------
+        # FINAL: Live HTML Preview (at the very end)
+        # ---------------------------
+        st.markdown("### 👀 Live HTML Preview")
+        if not filled_items:
+            st.info("No filled templates available to preview.")
+        else:
+            # Collect uploaded HTML URLs (if any)
+            uploaded_html_urls = [u for (k, u) in uploaded_urls if k == "HTML"]
+
+            preview_source = st.radio(
+                "Choose preview source",
+                options=["Local filled HTML", "Uploaded CDN URL"],
+                index=0 if filled_items else 1,
+                horizontal=True
+            )
+
+            if preview_source == "Local filled HTML":
+                # Show a select for local HTMLs
+                names = [name for name, _ in filled_items]
+                choice = st.selectbox("Select local HTML to preview", names, index=0)
+                chosen_html = next(html for (name, html) in filled_items if name == choice)
+                # Render the HTML directly
+                st_html(chosen_html, height=800, scrolling=True)
+            else:
+                if not uploaded_html_urls:
+                    st.info("No uploaded HTML URLs found yet. Upload step might have failed.")
+                else:
+                    cdn_choice = st.selectbox("Select uploaded CDN URL to preview", uploaded_html_urls, index=0)
+                    # Use an iframe to display remote page
+                    iframe = f'''
+                        <iframe src="{cdn_choice}" width="1600" height="800" style="border:0;"></iframe>
+                    '''
+                    st_html(iframe, height=820, scrolling=False)
+
+        # (optional) keep your minimal code preview toggle
+        show_preview = st.checkbox("Show raw HTML code of first filled template", value=False)
+        if show_preview and filled_items:
+            st.code(filled_items[0][1][:5000], language="html")
